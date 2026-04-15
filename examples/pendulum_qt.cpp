@@ -78,7 +78,7 @@ struct Simulation {
 
         // Gravity handled by sys.setGravity() via assembleForces()
 
-        sys.setSolver(std::make_shared<DirectSolver>());
+        sys.setSolver(std::make_shared<DirectSolver>()));
         mb::IntegratorConfig interconfig;
         interconfig.absTol=1e-4;
         interconfig.adaptive=true;
