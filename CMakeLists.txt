@@ -51,6 +51,16 @@ set(LIB_SOURCES
 
     # System
     src/system/MultibodySystem.cpp
+
+    # FEM / Flexible Bodies
+    src/fem/ElasticMaterial.cpp
+    src/fem/ANCFTetrahedralElement.cpp
+    src/fem/FlexibleBody.cpp
+    src/fem/GmshReader.cpp
+    src/fem/FlexibleContactDetector.cpp
+    src/fem/FlexibleContactForce.cpp
+    src/fem/FlexibleContactManager.cpp
+    src/fem/FlexibleIntegrators.cpp
 )
 
 add_library(multibody STATIC ${LIB_SOURCES})
@@ -63,13 +73,23 @@ target_include_directories(multibody PUBLIC
 add_executable(pendulum_example examples/pendulum.cpp)
 target_link_libraries(pendulum_example PRIVATE multibody)
 
+add_executable(flex_energy_test examples/flex_energy_test.cpp)
+target_link_libraries(flex_energy_test PRIVATE multibody)
+
 # ---- Qt visualization (optional) ----
 find_package(Qt5 COMPONENTS Widgets QUIET)
 if(Qt5_FOUND)
     set(CMAKE_AUTOMOC ON)
     add_executable(pendulum_qt examples/pendulum_qt.cpp)
     target_link_libraries(pendulum_qt PRIVATE multibody Qt5::Widgets)
-    message(STATUS "Qt5 found – building pendulum_qt")
+
+    add_executable(chain20_qt examples/chain20_qt.cpp)
+    target_link_libraries(chain20_qt PRIVATE multibody Qt5::Widgets)
+
+    add_executable(cantilever_qt examples/cantilever_qt.cpp)
+    target_link_libraries(cantilever_qt PRIVATE multibody Qt5::Widgets)
+
+    message(STATUS "Qt5 found – building pendulum_qt, chain20_qt, cantilever_qt")
 else()
     message(STATUS "Qt5 not found – skipping pendulum_qt")
 endif()
