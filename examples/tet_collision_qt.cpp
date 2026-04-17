@@ -19,6 +19,8 @@
 #include <QWheelEvent>
 #include <QElapsedTimer>
 #include <QFont>
+#include <QProcess>
+#include <QImage>
 #include <cmath>
 #include <vector>
 #include <array>
@@ -32,16 +34,44 @@
 using namespace mb;
 
 // ─── Body parameters ─────────────────────────────────────────────────────────
-static constexpr double LA_X=0.30, LA_Y=0.08, LA_Z=0.08;
-static constexpr int    NXA=4, NYA=2, NZA=2;
-static constexpr double EA=70e9, RHO_A=7800.0;   // çelik (steel)
-
-static constexpr double LB_X=0.20, LB_Y=0.10, LB_Z=0.10;
-static constexpr int    NXB=3, NYB=2, NZB=2;
-static constexpr double EB=200e9, RHO_B=7800.0;  // çelik (steel)
-
+static constexpr double TET_SIZE = 0.15;          // kenar uzunluğu
+static constexpr double EA=1e7, RHO_A=1200.0;    // sert kauçuk
+static constexpr double EB=5e6, RHO_B=1000.0;    // orta sert
 static constexpr double NU = 0.3;
-static constexpr int    NSUB = 50;
+static constexpr int    NSUB = 200;
+static constexpr double RECORD_DURATION = 8.0;  // saniye
+static constexpr int    RECORD_FPS = 60;
+
+// Tek tetrahedron mesh oluştur (taban altta)
+static GmshMesh makeSingleTet(double sz, double dx, double dy, double dz){
+    GmshMesh m;
+    double a = sz;
+    m.nodes = {
+        {1, dx + 0.0,    dy + 0.0,    dz + 0.0},
+        {2, dx + a,      dy + 0.0,    dz + 0.0},
+        {3, dx + a*0.5,  dy + 0.0,    dz + a*0.866},
+        {4, dx + a*0.5,  dy + a*0.816, dz + a*0.289}
+    };
+    m.elements = {{1, 4, {1,2,3,4}}};
+    return m;
+}
+
+// Ters tetrahedron: sivri uç altta (y=0), taban yukarıda
+static GmshMesh makeInvertedTet(double sz, double dx, double dy, double dz){
+    GmshMesh m;
+    double a = sz;
+    double h = a * 0.816;  // tetrahedron yüksekliği
+    // Node 1: sivri uç altta (y=0)
+    // Node 2,3,4: üçgen taban yukarıda (y=h)
+    m.nodes = {
+        {1, dx + a*0.5,  dy + 0.0,    dz + a*0.289},  // tepe (altta)
+        {2, dx + 0.0,    dy + h,      dz + 0.0},       // taban köşe 1
+        {3, dx + a,      dy + h,      dz + 0.0},       // taban köşe 2
+        {4, dx + a*0.5,  dy + h,      dz + a*0.866}    // taban köşe 3
+    };
+    m.elements = {{1, 4, {1,2,3,4}}};
+    return m;
+}
 
 // ─── Mesh helper ─────────────────────────────────────────────────────────────
 static void shiftMesh(GmshMesh& m, double dx, double dy, double dz){
@@ -70,40 +100,40 @@ struct Sim {
         // Contact config
         FlexContactConfig cfg;
         cfg.hertzExponent = 1.5;
-        cfg.maxStiffness = 1e8;
+        cfg.maxStiffness = 1e6;
         contactMgr = std::make_unique<FlexibleContactManager>(cfg);
 
-        // Body A: stiff platform, bottom face fixed
+        // Body A: ters tetrahedron, sivri ucu ground'da
         {
-            auto mesh=generateBoxTetMesh(LA_X,LA_Y,LA_Z,NXA,NYA,NZA);
+            auto mesh=makeInvertedTet(TET_SIZE, 0.0, 0.0, 0.0);
             ElasticMaterialProps mat{EA,NU,RHO_A,MaterialType::NeoHookean};
             bodyA=FlexibleBody::fromMesh(mesh,mat,"A",true);
-            bodyA->gravity={0,-9.81,0}; bodyA->dampingAlpha=20.0;
-            bodyA->fixNodesOnPlane('y',0.0,1e-6);
+            bodyA->gravity={0,-9.81,0}; bodyA->dampingAlpha=5.0;
+            bodyA->fixNodesOnPlane('y',0.0,1e-6);  // sivri ucu sabitler
             intA=std::make_unique<ImplicitFlexIntegrator>(*bodyA);
             intA->hhtAlpha=-0.1; intA->newtonTol=1e-4; intA->maxNewtonIter=30;
         }
-        // Body B: soft impactor above A
+        // Body B: üst tetrahedron, serbest düşüş
         {
-            auto mesh=generateBoxTetMesh(LB_X,LB_Y,LB_Z,NXB,NYB,NZB);
-            shiftMesh(mesh,(LA_X-LB_X)*0.5, LA_Y+0.15, (LA_Z-LB_Z)*0.5);
+            double hA = TET_SIZE * 0.816;  // A'nın yüksekliği
+            auto mesh=makeSingleTet(TET_SIZE, 0.0, hA+0.12, 0.0);
             ElasticMaterialProps mat{EB,NU,RHO_B,MaterialType::NeoHookean};
             bodyB=FlexibleBody::fromMesh(mesh,mat,"B",true);
-            bodyB->gravity={0,-9.81,0}; bodyB->dampingAlpha=15.0;
+            bodyB->gravity={0,-9.81,0}; bodyB->dampingAlpha=5.0;
             intB=std::make_unique<ImplicitFlexIntegrator>(*bodyB);
             intB->hhtAlpha=-0.1; intB->newtonTol=1e-4; intB->maxNewtonIter=30;
         }
         tetA=bodyA->getTetConnectivity();
         tetB=bodyB->getTetConnectivity();
         // Register bodies with contact manager
-        FlexContactMaterial matA{0.1, 0.5, EA, NU};
-        FlexContactMaterial matB{0.1, 0.5, EB, NU};
+        FlexContactMaterial matA{0.8, 0.3, EA, NU};
+        FlexContactMaterial matB{0.8, 0.3, EB, NU};
         contactMgr->addBody(*bodyA, matA);
         contactMgr->addBody(*bodyB, matB);
         contactMgr->enableGround(GroundPlane{0.0, {0,1,0}});
-        contactMgr->setContactMargin(0.01);
-        contactMgr->setMaxDepth(0.01);
-        contactMgr->maxForcePerDof = 5e4;
+        contactMgr->setContactMargin(0.002);
+        contactMgr->setMaxDepth(0.005);
+        contactMgr->maxForcePerDof = 800.0;
 
         time=0;
         updateRenderData();
@@ -147,8 +177,8 @@ struct Sim {
                 }
                 if(clamped) b.setFlexQd(qd);
             };
-            clampVel(*bodyA,5.0);
-            clampVel(*bodyB,5.0);
+            clampVel(*bodyA,10.0);
+            clampVel(*bodyB,10.0);
         }
         time+=dt;
         updateRenderData();
@@ -175,7 +205,7 @@ struct Sim {
 class TetCollisionWidget : public QWidget {
 public:
     TetCollisionWidget(QWidget* parent=nullptr):QWidget(parent){
-        setWindowTitle("MBC++ — ANCF Flexible Body Collision (FlexibleContactManager)");
+        setWindowTitle("MBC++ — İki Tetrahedron Çarpışması");
         resize(1200,700);
         sim_.build();
         timer_=new QTimer(this);
@@ -184,6 +214,13 @@ public:
         elapsed_.start();
         setFocusPolicy(Qt::StrongFocus);
         azimuth_=0.5; elevation_=0.28;
+
+        // Start ffmpeg recording
+        startRecording();
+    }
+
+    ~TetCollisionWidget(){
+        stopRecording();
     }
 
 protected:
@@ -243,6 +280,10 @@ protected:
                     path.lineTo(pts[fi[f][2]]); path.closeSubpath();
                     p.fillPath(path,fc);
                 }
+                // Kenar çizgileri (kalın beyaz)
+                p.setPen(QPen(QColor(255,255,255),2.5));
+                for(int k=0;k<6;k++)
+                    p.drawLine(pts[ei[k][0]],pts[ei[k][1]]);
             }
         };
 
@@ -289,7 +330,21 @@ protected:
     }
 
 private slots:
-    void tick(){if(!paused_)sim_.step(0.016);frameCount_++;update();}
+    void tick(){
+        double dt=1.0/RECORD_FPS;
+        if(!paused_) sim_.step(dt);
+        frameCount_++;
+        repaint();  // synchronous paint
+        // Write frame to ffmpeg after paint
+        if(recording_ && ffmpeg_ && ffmpeg_->state()==QProcess::Running){
+            QImage img=grab().toImage().convertToFormat(QImage::Format_RGBA8888);
+            ffmpeg_->write((const char*)img.constBits(), img.sizeInBytes());
+            recordedFrames_++;
+            if(recordedFrames_ >= RECORD_FPS * RECORD_DURATION){
+                stopRecording();
+            }
+        }
+    }
 
 private:
     Sim sim_;
@@ -297,6 +352,46 @@ private:
     bool paused_=false; int frameCount_=0;
     double zoom_=1.0,azimuth_=0,elevation_=0,panX_=0,panY_=0;
     QPoint lastMousePos_;
+
+    // Recording
+    QProcess* ffmpeg_=nullptr;
+    bool recording_=false;
+    int recordedFrames_=0;
+
+    void startRecording(){
+        ffmpeg_=new QProcess(this);
+        QString cmd="ffmpeg";
+        QStringList args;
+        args<<"-y"
+            <<"-f"<<"rawvideo"
+            <<"-pixel_format"<<"rgba"
+            <<"-video_size"<<QString("%1x%2").arg(width()).arg(height())
+            <<"-framerate"<<QString::number(RECORD_FPS)
+            <<"-i"<<"pipe:0"
+            <<"-c:v"<<"libx264"
+            <<"-preset"<<"fast"
+            <<"-crf"<<"18"
+            <<"-pix_fmt"<<"yuv420p"
+            <<"-movflags"<<"+faststart"
+            <<"tet_collision.mp4";
+        ffmpeg_->setWorkingDirectory(QApplication::applicationDirPath());
+        ffmpeg_->start(cmd,args);
+        ffmpeg_->waitForStarted(3000);
+        recording_=true;
+        recordedFrames_=0;
+        qDebug("Recording started: %dx%d @ %d fps, %.1f s",width(),height(),RECORD_FPS,RECORD_DURATION);
+    }
+
+    void stopRecording(){
+        if(!recording_) return;
+        recording_=false;
+        if(ffmpeg_){
+            ffmpeg_->closeWriteChannel();
+            ffmpeg_->waitForFinished(10000);
+            qDebug("Recording finished: %d frames -> tet_collision.mp4",recordedFrames_);
+            ffmpeg_->deleteLater(); ffmpeg_=nullptr;
+        }
+    }
 
     void drawHUD(QPainter& p,int w,int){
         double fps=frameCount_/(elapsed_.elapsed()*0.001+1e-9);
@@ -320,8 +415,8 @@ private:
             p.setPen(QColor(80,200,80)); line("○ no contact"); p.setPen(QColor(200,200,200));
         }
         line("");
-        line(QString("A: E=%1 Pa  ρ=%2  (sert)").arg(EA,0,'e',1).arg(int(RHO_A)));
-        line(QString("B: E=%1 Pa  ρ=%2  (yumuşak)").arg(EB,0,'e',1).arg(int(RHO_B)));
+        line(QString("A: E=%1 Pa  ρ=%2").arg(EA,0,'e',1).arg(int(RHO_A)));
+        line(QString("B: E=%1 Pa  ρ=%2").arg(EB,0,'e',1).arg(int(RHO_B)));
         line("");
         line(QString("DOF A: %1  B: %2").arg(sim_.bodyA->numDof).arg(sim_.bodyB->numDof));
         line(QString("KE: %1 J").arg(sim_.kineticEnergy(),0,'e',3));
@@ -339,9 +434,9 @@ private:
         r("R              Sıfırla");
         r("ESC            Çıkış");
         p.setPen(QColor(255,150,80));
-        p.drawText(bx,by2+10,"■ A: sert platform (turuncu)");
+        p.drawText(bx,by2+10,"■ A: alt tetra (turuncu)");
         p.setPen(QColor(80,150,255));
-        p.drawText(bx,by2+28,"■ B: yumuşak impactor (mavi)");
+        p.drawText(bx,by2+28,"■ B: üst tetra (mavi)");
 
         if(paused_){
             p.setPen(QColor(255,80,80));
