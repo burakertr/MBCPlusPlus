@@ -89,7 +89,10 @@ if(Qt5_FOUND)
     add_executable(cantilever_qt examples/cantilever_qt.cpp)
     target_link_libraries(cantilever_qt PRIVATE multibody Qt5::Widgets)
 
-    message(STATUS "Qt5 found – building pendulum_qt, chain20_qt, cantilever_qt")
+    add_executable(spinning_beam_qt examples/spinning_beam_qt.cpp)
+    target_link_libraries(spinning_beam_qt PRIVATE multibody Qt5::Widgets)
+
+    message(STATUS "Qt5 found – building pendulum_qt, chain20_qt, cantilever_qt, spinning_beam_qt")
 else()
     message(STATUS "Qt5 not found – skipping pendulum_qt")
 endif()
