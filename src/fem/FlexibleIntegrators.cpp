@@ -244,6 +244,9 @@ FlexStepResult FlexDOPRI45::step(double dtTarget) {
     return {body_.getMaxDisplacement(), SE, KE, PE};
 }
 
+ImplicitFlexIntegrator::ImplicitFlexIntegrator(FlexibleBody& body)
+    : body_(body), aPrev_(body.numDof, 0.0) {}
+
 const std::vector<double>& ImplicitFlexIntegrator::ensureMassInverse() {
     if (!MInvDiag_.empty()) return MInvDiag_;
     int n = body_.numDof;
