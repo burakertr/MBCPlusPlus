@@ -33,6 +33,8 @@
 #include "mb/fem/ANCFTypes.h"
 #include "mb/fem/FlexibleBody.h"
 #include "mb/fem/FlexibleIntegrators.h"
+#include "mb/core/ThreadConfig.h"
+#include <cstdlib>
 
 using namespace mb;
 
@@ -44,11 +46,11 @@ static constexpr double BEAM_Ly   = 0.05;    // height (m)
 static constexpr double BEAM_Lz   = 0.05;    // depth  (m)
 static constexpr int    MESH_NX   = 10;
 static constexpr int    MESH_NY   = 2;
-static constexpr int    MESH_NZ   = 1;
+static constexpr int    MESH_NZ   = 2;
 
 // Material (Neo-Hookean — stable under large deformation)
 // E=2e8 Pa gives ~23 cm static tip deflection (visible but no element inversion)
-static constexpr double MAT_E     = 70e5;     // Pa
+static constexpr double MAT_E     = 70e4;     // Pa
 static constexpr double MAT_NU    = 0.3;
 static constexpr double MAT_RHO   = 7800.0;  // kg/m³
 
@@ -78,7 +80,7 @@ struct Simulation {
         body = FlexibleBody::fromMesh(mesh, mat, "Cantilever", true);
 
         body->gravity = Vec3(0, -9.81, 0);
-        body->dampingAlpha = 0;   // no damping — pure dynamics
+        body->dampingAlpha = 10;   // light damping — settles to static equilibrium
 
         // Fix the left face (x ≈ 0)
         body->fixNodesOnPlane('x', 0.0, 1e-6);
@@ -453,6 +455,13 @@ private:
 
 // ─────────────────────────────────────────────
 int main(int argc, char* argv[]) {
+    // Parse -c N for thread count
+    for (int i = 1; i < argc; i++) {
+        if (std::string(argv[i]) == "-c" && i+1 < argc) {
+            ThreadConfig::setNumThreads(std::atoi(argv[++i]));
+        }
+    }
+
     QApplication app(argc, argv);
     CantileverWidget win;
     win.show();

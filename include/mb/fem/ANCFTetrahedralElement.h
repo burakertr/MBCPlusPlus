@@ -22,6 +22,7 @@ struct GaussPoint {
 class ANCFTetrahedralElement {
 public:
     std::array<int, 4> nodeIds;
+    bool alive = true;  ///< false = element has been removed (fracture)
 
     /**
      * Construct from connectivity, node data, and material.

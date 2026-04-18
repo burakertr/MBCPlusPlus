@@ -24,6 +24,8 @@
 #include "mb/solvers/DirectSolver.h"
 #include "mb/integrators/RungeKutta.h"
 #include "mb/system/MultibodySystem.h"
+#include "mb/core/ThreadConfig.h"
+#include <cstdlib>
 
 using namespace mb;
 
@@ -377,6 +379,13 @@ private:
 
 // ─────────────────────────────────────────────
 int main(int argc, char* argv[]) {
+    // Parse -c N for thread count
+    for (int i = 1; i < argc; i++) {
+        if (std::string(argv[i]) == "-c" && i+1 < argc) {
+            ThreadConfig::setNumThreads(std::atoi(argv[++i]));
+        }
+    }
+
     QApplication app(argc, argv);
     PendulumWidget win;
     win.show();

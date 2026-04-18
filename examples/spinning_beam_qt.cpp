@@ -40,6 +40,8 @@
 #include "mb/fem/ANCFTypes.h"
 #include "mb/fem/FlexibleBody.h"
 #include "mb/fem/FlexibleIntegrators.h"
+#include "mb/core/ThreadConfig.h"
+#include <cstdlib>
 
 using namespace mb;
 
@@ -550,6 +552,13 @@ private:
 
 // ─────────────────────────────────────────────
 int main(int argc, char* argv[]) {
+    // Parse -c N for thread count
+    for (int i = 1; i < argc; i++) {
+        if (std::string(argv[i]) == "-c" && i+1 < argc) {
+            ThreadConfig::setNumThreads(std::atoi(argv[++i]));
+        }
+    }
+
     QApplication app(argc, argv);
     SpinningBeamWidget win;
     win.show();

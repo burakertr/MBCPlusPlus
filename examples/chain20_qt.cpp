@@ -15,6 +15,8 @@
 #include <QKeyEvent>
 #include <QElapsedTimer>
 #include <QFont>
+#include <QProcess>
+#include <QImage>
 #include <cmath>
 #include <deque>
 #include <vector>
@@ -25,6 +27,8 @@
 #include "mb/solvers/DirectSolver.h"
 #include "mb/integrators/RungeKutta.h"
 #include "mb/system/MultibodySystem.h"
+#include "mb/core/ThreadConfig.h"
+#include <cstdlib>
 
 using namespace mb;
 
@@ -32,9 +36,9 @@ using namespace mb;
 //  Constants
 // ─────────────────────────────────────────────
 static constexpr int N_LINKS = 20;
-static constexpr double LINK_LENGTH = 0.3;   // metres per link
+static constexpr double LINK_LENGTH = 0.5;   // metres per link
 static constexpr double LINK_MASS   = 0.2;   // kg per link
-static constexpr double LINK_RADIUS = 0.008; // visual rod radius
+static constexpr double LINK_RADIUS = 0.05; // visual rod radius
 
 // ─────────────────────────────────────────────
 //  Nice rainbow palette
@@ -152,7 +156,8 @@ struct Simulation {
 // ─────────────────────────────────────────────
 class ChainWidget : public QWidget {
 public:
-    ChainWidget(QWidget* parent = nullptr) : QWidget(parent) {
+    ChainWidget(bool record = false, QWidget* parent = nullptr)
+        : QWidget(parent), recording_(record) {
         setWindowTitle("MBC++ — 20 Sarkaç Zinciri");
         resize(1100, 850);
         setMinimumSize(800, 600);
@@ -160,12 +165,31 @@ public:
         sim_.build();
         traceMax_ = 4000;
 
+        if (recording_) {
+            ffmpeg_ = new QProcess(this);
+            QStringList args;
+            args << "-y" << "-f" << "rawvideo" << "-pixel_format" << "bgra"
+                 << "-video_size" << QString("%1x%2").arg(width()).arg(height())
+                 << "-framerate" << "60"
+                 << "-i" << "pipe:0"
+                 << "-c:v" << "libx264" << "-preset" << "fast"
+                 << "-crf" << "18" << "-pix_fmt" << "yuv420p"
+                 << "chain_sim.mp4";
+            ffmpeg_->start("ffmpeg", args);
+            ffmpeg_->waitForStarted();
+            printf("[REC] Recording to chain_sim.mp4 (%dx%d @60fps)\n", width(), height());
+        }
+
         timer_ = new QTimer(this);
         connect(timer_, &QTimer::timeout, this, &ChainWidget::tick);
         timer_->start(16);  // ~60 FPS
 
         elapsed_.start();
         setFocusPolicy(Qt::StrongFocus);
+    }
+
+    ~ChainWidget() override {
+        stopRecording();
     }
 
 protected:
@@ -258,6 +282,7 @@ protected:
             elapsed_.restart();
             frameCount_ = 0;
         } else if (e->key() == Qt::Key_Escape) {
+            stopRecording();
             close();
         }
     }
@@ -272,6 +297,14 @@ private slots:
         }
         frameCount_++;
         update();
+
+        // Write frame to ffmpeg pipe
+        if (recording_ && ffmpeg_ && ffmpeg_->state() == QProcess::Running) {
+            QImage img(size(), QImage::Format_ARGB32);
+            img.fill(Qt::black);
+            render(&img);
+            ffmpeg_->write((const char*)img.constBits(), img.sizeInBytes());
+        }
     }
 
 private:
@@ -281,6 +314,17 @@ private:
     bool paused_   = false;
     int  frameCount_ = 0;
     int  traceMax_;
+    bool recording_ = false;
+    QProcess* ffmpeg_ = nullptr;
+
+    void stopRecording() {
+        if (ffmpeg_ && ffmpeg_->state() == QProcess::Running) {
+            ffmpeg_->closeWriteChannel();
+            ffmpeg_->waitForFinished(5000);
+            printf("[REC] Saved chain_sim.mp4\n");
+            ffmpeg_ = nullptr;
+        }
+    }
     std::deque<Vec3> trace_;
 
     void drawGrid(QPainter& p, double cx, double cy, double ppm, int w, int h) {
@@ -345,8 +389,19 @@ private:
 
 // ─────────────────────────────────────────────
 int main(int argc, char* argv[]) {
+    bool record = false;
+    // Parse -c N for thread count, -r for recording
+    for (int i = 1; i < argc; i++) {
+        if (std::string(argv[i]) == "-c" && i+1 < argc) {
+            ThreadConfig::setNumThreads(std::atoi(argv[++i]));
+        } else if (std::string(argv[i]) == "-r") {
+            record = true;
+        }
+    }
+    printf("[MBC++] Using %d OpenMP thread(s)\n", ThreadConfig::numThreads());
+
     QApplication app(argc, argv);
-    ChainWidget win;
+    ChainWidget win(record);
     win.show();
     return app.exec();
 }

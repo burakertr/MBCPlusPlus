@@ -7,10 +7,12 @@ namespace mb {
 RevoluteJoint::RevoluteJoint(RigidBody* body1, RigidBody* body2,
                              const Vec3& localPoint1, const Vec3& localPoint2,
                              const Vec3& localAxis1, const Vec3& localAxis2,
+                             double damping,
                              const std::string& name)
     : Constraint(name), body1_(body1), body2_(body2),
       localPoint1_(localPoint1), localPoint2_(localPoint2),
-      localAxis1_(localAxis1.normalize()), localAxis2_(localAxis2.normalize()) {}
+      localAxis1_(localAxis1.normalize()), localAxis2_(localAxis2.normalize()),
+      damping_(damping) {}
 
 std::vector<int> RevoluteJoint::getBodyIds() const {
     return {body1_->id, body2_->id};
@@ -31,6 +33,28 @@ std::pair<Vec3, Vec3> RevoluteJoint::getPerpAxes(const Vec3& worldAxis) const {
     Vec3 e = a.cross(ref).normalize();
     Vec3 f = a.cross(e).normalize();
     return {e, f};
+}
+
+double RevoluteJoint::getRelativeAngularVelocity() const {
+    Vec3 axis = getAxis1World();
+    Vec3 wRel = body2_->angularVelocity.sub(body1_->angularVelocity);
+    return wRel.dot(axis);
+}
+
+void RevoluteJoint::applyDamping() {
+    if (damping_ <= 0.0) return;
+
+    Vec3 axis = getAxis1World();
+    double wRel = getRelativeAngularVelocity();
+
+    // Damping torque: τ = -c * ω_rel * axis
+    Vec3 dampTorque = axis.scale(-damping_ * wRel);
+
+    // Apply to body2, reaction to body1
+    if (body2_->isDynamic())
+        body2_->applyTorque(dampTorque);
+    if (body1_->isDynamic())
+        body1_->applyTorque(dampTorque.negate());
 }
 
 ConstraintViolation RevoluteJoint::computeViolation() const {

@@ -69,6 +69,15 @@ target_include_directories(multibody PUBLIC
     $<INSTALL_INTERFACE:include>
 )
 
+# ---- OpenMP ----
+find_package(OpenMP REQUIRED)
+target_link_libraries(multibody PUBLIC OpenMP::OpenMP_CXX)
+
+# ---- BLAS / LAPACK (OpenBLAS) ----
+find_package(BLAS REQUIRED)
+find_package(LAPACK REQUIRED)
+target_link_libraries(multibody PUBLIC ${LAPACK_LIBRARIES} ${BLAS_LIBRARIES})
+
 # ---- Example executable ----
 add_executable(pendulum_example examples/pendulum.cpp)
 target_link_libraries(pendulum_example PRIVATE multibody)
@@ -86,6 +95,12 @@ if(Qt5_FOUND)
     add_executable(chain20_qt examples/chain20_qt.cpp)
     target_link_libraries(chain20_qt PRIVATE multibody Qt5::Widgets)
 
+    add_executable(chain20_revolute_qt examples/chain20_revolute_qt.cpp)
+    target_link_libraries(chain20_revolute_qt PRIVATE multibody Qt5::Widgets)
+
+    add_executable(mcpherson_qt examples/mcpherson_qt.cpp)
+    target_link_libraries(mcpherson_qt PRIVATE multibody Qt5::Widgets)
+
     add_executable(cantilever_qt examples/cantilever_qt.cpp)
     target_link_libraries(cantilever_qt PRIVATE multibody Qt5::Widgets)
 
@@ -95,7 +110,16 @@ if(Qt5_FOUND)
     add_executable(tet_collision_qt examples/tet_collision_qt.cpp)
     target_link_libraries(tet_collision_qt PRIVATE multibody Qt5::Widgets)
 
-    message(STATUS "Qt5 found – building pendulum_qt, chain20_qt, cantilever_qt, spinning_beam_qt, tet_collision_qt")
+    add_executable(tet_collision2_qt examples/tet_collision2_qt.cpp)
+    target_link_libraries(tet_collision2_qt PRIVATE multibody Qt5::Widgets)
+
+    add_executable(rolling_cylinder_qt examples/rolling_cylinder_qt.cpp)
+    target_link_libraries(rolling_cylinder_qt PRIVATE multibody Qt5::Widgets)
+
+    add_executable(bending_fracture_qt examples/bending_fracture_qt.cpp)
+    target_link_libraries(bending_fracture_qt PRIVATE multibody Qt5::Widgets)
+
+    message(STATUS "Qt5 found – building all Qt demos")
 else()
     message(STATUS "Qt5 not found – skipping pendulum_qt")
 endif()

@@ -1,4 +1,5 @@
 #include "mb/fem/FlexibleIntegrators.h"
+#include <omp.h>
 #include <cmath>
 #include <algorithm>
 #include <iostream>
@@ -370,7 +371,7 @@ FlexStepResult ImplicitFlexIntegrator::step(double dt) {
         rNorm = std::sqrt(rNorm);
         if (rNorm < newtonTol) break;
 
-        // Build tangent via central FD
+        // Build tangent via central FD (columns are independent)
         std::vector<double> S(nf*nf);
         double dampFactor = 1.0 + hhtForceScale*gamma*h*body_.dampingAlpha;
         for (int ii = 0; ii < nf; ii++)
@@ -383,7 +384,7 @@ FlexStepResult ImplicitFlexIntegrator::step(double dt) {
 
             auto qPlus = qCurr; qPlus[j] += eps_j;
             body_.setFlexQ(qPlus); body_.setFlexQd(vCurr);
-            auto QPlus = body_.computeTotalForces();
+            auto QPlus = body_.computeTotalForces();  // inner OMP in elastic forces
 
             auto qMinus = qCurr; qMinus[j] -= eps_j;
             body_.setFlexQ(qMinus); body_.setFlexQd(vCurr);

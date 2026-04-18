@@ -1,4 +1,5 @@
 #include "mb/fem/FlexibleContactDetector.h"
+#include <omp.h>
 #include <cmath>
 #include <algorithm>
 #include <map>
@@ -193,47 +194,59 @@ std::vector<FlexContact> FlexibleContactDetector::detectNodeToSurface(
     sMinX -= inflate; sMinY -= inflate; sMinZ -= inflate;
     sMaxX += inflate; sMaxY += inflate; sMaxZ += inflate;
 
-    for (int ni : nodeIndices) {
-        auto& qn = nodeBody.nodes[ni].q;
-        double px = qn[0], py = qn[1], pz = qn[2];
+    // Convert set to vector for indexed parallel access
+    std::vector<int> nodeVec(nodeIndices.begin(), nodeIndices.end());
+    int nNodes = (int)nodeVec.size();
 
-        if (px < sMinX || px > sMaxX || py < sMinY || py > sMaxY || pz < sMinZ || pz > sMaxZ)
-            continue;
+    #pragma omp parallel
+    {
+        std::vector<FlexContact> localContacts;
+        #pragma omp for schedule(static) nowait
+        for (int idx = 0; idx < nNodes; idx++) {
+            int ni = nodeVec[idx];
+            auto& qn = nodeBody.nodes[ni].q;
+            double px = qn[0], py = qn[1], pz = qn[2];
 
-        double maxSD = -1e30;
-        int maxSDFace = -1;
+            if (px < sMinX || px > sMaxX || py < sMinY || py > sMaxY || pz < sMinZ || pz > sMaxZ)
+                continue;
 
-        for (int ti = 0; ti < nTris; ti++) {
-            int off = ti * 7;
-            double invLen = triPlaneData_[off+6];
-            if (invLen == 0) continue;
-            double dx = px - triPlaneData_[off];
-            double dy = py - triPlaneData_[off+1];
-            double dz = pz - triPlaneData_[off+2];
-            double sd = (dx*triPlaneData_[off+3] + dy*triPlaneData_[off+4] + dz*triPlaneData_[off+5]) * invLen;
-            if (sd > maxSD) { maxSD = sd; maxSDFace = ti; }
+            double maxSD = -1e30;
+            int maxSDFace = -1;
+
+            for (int ti = 0; ti < nTris; ti++) {
+                int off = ti * 7;
+                double invLen = triPlaneData_[off+6];
+                if (invLen == 0) continue;
+                double dx = px - triPlaneData_[off];
+                double dy = py - triPlaneData_[off+1];
+                double dz = pz - triPlaneData_[off+2];
+                double sd = (dx*triPlaneData_[off+3] + dy*triPlaneData_[off+4] + dz*triPlaneData_[off+5]) * invLen;
+                if (sd > maxSD) { maxSD = sd; maxSDFace = ti; }
+            }
+
+            if (maxSDFace < 0 || maxSD > margin) continue;
+
+            double depth = margin - maxSD;
+            if (depth < minDepth || depth > maxDepth) continue;
+
+            const auto& tri = surfTris[maxSDFace];
+            Vec3 v0(surfBody.nodes[tri.n0].q[0], surfBody.nodes[tri.n0].q[1], surfBody.nodes[tri.n0].q[2]);
+            Vec3 v1(surfBody.nodes[tri.n1].q[0], surfBody.nodes[tri.n1].q[1], surfBody.nodes[tri.n1].q[2]);
+            Vec3 v2(surfBody.nodes[tri.n2].q[0], surfBody.nodes[tri.n2].q[1], surfBody.nodes[tri.n2].q[2]);
+
+            Vec3 e1 = v1 - v0, e2 = v2 - v0;
+            Vec3 rawN = e1.cross(e2);
+            double nLen = rawN.length();
+            if (nLen < 1e-20) continue;
+            Vec3 n = rawN * (1.0/nLen);
+
+            Vec3 P(px, py, pz);
+            Vec3 closest = closestPointOnTri(P, v0, v1, v2);
+
+            localContacts.push_back({&nodeBody, ni, &surfBody, maxSDFace, closest, n, depth});
         }
-
-        if (maxSDFace < 0 || maxSD > margin) continue;
-
-        double depth = margin - maxSD;
-        if (depth < minDepth || depth > maxDepth) continue;
-
-        const auto& tri = surfTris[maxSDFace];
-        Vec3 v0(surfBody.nodes[tri.n0].q[0], surfBody.nodes[tri.n0].q[1], surfBody.nodes[tri.n0].q[2]);
-        Vec3 v1(surfBody.nodes[tri.n1].q[0], surfBody.nodes[tri.n1].q[1], surfBody.nodes[tri.n1].q[2]);
-        Vec3 v2(surfBody.nodes[tri.n2].q[0], surfBody.nodes[tri.n2].q[1], surfBody.nodes[tri.n2].q[2]);
-
-        Vec3 e1 = v1 - v0, e2 = v2 - v0;
-        Vec3 rawN = e1.cross(e2);
-        double nLen = rawN.length();
-        if (nLen < 1e-20) continue;
-        Vec3 n = rawN * (1.0/nLen);
-
-        Vec3 P(px, py, pz);
-        Vec3 closest = closestPointOnTri(P, v0, v1, v2);
-
-        contacts.push_back({&nodeBody, ni, &surfBody, maxSDFace, closest, n, depth});
+        #pragma omp critical
+        contacts.insert(contacts.end(), localContacts.begin(), localContacts.end());
     }
 
     return contacts;

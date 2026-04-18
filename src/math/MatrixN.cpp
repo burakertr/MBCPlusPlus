@@ -3,6 +3,24 @@
 #include <algorithm>
 #include <stdexcept>
 
+// BLAS / LAPACK Fortran interface
+extern "C" {
+    void dgemm_(const char* transA, const char* transB,
+                const int* m, const int* n, const int* k,
+                const double* alpha, const double* A, const int* lda,
+                const double* B, const int* ldb,
+                const double* beta, double* C, const int* ldc);
+    void dgemv_(const char* trans, const int* m, const int* n,
+                const double* alpha, const double* A, const int* lda,
+                const double* x, const int* incx,
+                const double* beta, double* y, const int* incy);
+    void dgetrf_(const int* m, const int* n, double* A, const int* lda,
+                 int* ipiv, int* info);
+    void dgetrs_(const char* trans, const int* n, const int* nrhs,
+                 const double* A, const int* lda, const int* ipiv,
+                 double* B, const int* ldb, int* info);
+}
+
 namespace mb {
 
 // ============== MatrixN ==============
@@ -53,15 +71,11 @@ std::vector<double> MatrixN::getRow(int row) const {
 
 MatrixN MatrixN::multiply(const MatrixN& other) const {
     MatrixN result(rows, other.cols);
-    for (int j = 0; j < other.cols; j++) {
-        for (int k = 0; k < cols; k++) {
-            double bkj = other.data[j * other.rows + k];
-            if (bkj == 0.0) continue;
-            for (int i = 0; i < rows; i++) {
-                result.data[j * rows + i] += data[k * rows + i] * bkj;
-            }
-        }
-    }
+    double alpha = 1.0, beta = 0.0;
+    int m = rows, n = other.cols, k = cols;
+    dgemm_("N", "N", &m, &n, &k, &alpha,
+           data.data(), &m, other.data.data(), &other.rows,
+           &beta, result.data.data(), &m);
     return result;
 }
 
@@ -96,43 +110,30 @@ MatrixN MatrixN::scale(double s) const {
 
 std::tuple<MatrixN, MatrixN, std::vector<int>, int> MatrixN::luDecompose() const {
     int n = rows;
-    MatrixN L = MatrixN::identity(n);
-    MatrixN U(n, n);
-    U.data = data; // copy
+    MatrixN LU(n, n);
+    LU.data = data;
 
+    std::vector<int> ipiv(n);
+    int info = 0;
+    dgetrf_(&n, &n, LU.data.data(), &n, ipiv.data(), &info);
+
+    // Extract L and U from packed LU
+    MatrixN L = MatrixN::identity(n);
+    MatrixN U = MatrixN::zeros(n, n);
+    for (int j = 0; j < n; j++) {
+        for (int i = 0; i <= j; i++) U.set(i, j, LU.get(i, j));
+        for (int i = j + 1; i < n; i++) L.set(i, j, LU.get(i, j));
+    }
+
+    // Convert LAPACK 1-based ipiv to 0-based permutation
     std::vector<int> pivot(n);
     for (int i = 0; i < n; i++) pivot[i] = i;
     int sign = 1;
-
-    for (int k = 0; k < n; k++) {
-        // Find pivot
-        int maxRow = k;
-        double maxVal = std::abs(U.get(k, k));
-        for (int i = k + 1; i < n; i++) {
-            double v = std::abs(U.get(i, k));
-            if (v > maxVal) { maxVal = v; maxRow = i; }
-        }
-
-        if (maxRow != k) {
-            // Swap rows in U
-            for (int j = 0; j < n; j++)
-                std::swap(U.data[j * n + k], U.data[j * n + maxRow]);
-            // Swap rows in L (only below diagonal)
-            for (int j = 0; j < k; j++)
-                std::swap(L.data[j * n + k], L.data[j * n + maxRow]);
-            std::swap(pivot[k], pivot[maxRow]);
+    for (int i = 0; i < n; i++) {
+        int swap_idx = ipiv[i] - 1; // LAPACK is 1-based
+        if (swap_idx != i) {
+            std::swap(pivot[i], pivot[swap_idx]);
             sign = -sign;
-        }
-
-        double ukk = U.get(k, k);
-        if (std::abs(ukk) < 1e-14) continue;
-
-        for (int i = k + 1; i < n; i++) {
-            double factor = U.get(i, k) / ukk;
-            L.set(i, k, factor);
-            for (int j = k; j < n; j++) {
-                U.set(i, j, U.get(i, j) - factor * U.get(k, j));
-            }
         }
     }
 
@@ -140,35 +141,21 @@ std::tuple<MatrixN, MatrixN, std::vector<int>, int> MatrixN::luDecompose() const
 }
 
 MatrixN MatrixN::solve(const MatrixN& b) const {
-    auto [L, U, pivot, sign] = luDecompose();
     int n = rows;
     int nrhs = b.cols;
+
+    // Factor
+    std::vector<double> A_copy(data);
+    std::vector<int> ipiv(n);
+    int info = 0;
+    dgetrf_(&n, &n, A_copy.data(), &n, ipiv.data(), &info);
+
+    // Solve (dgetrs overwrites B in-place)
     MatrixN X(n, nrhs);
-
-    for (int col = 0; col < nrhs; col++) {
-        // Apply pivot to b
-        std::vector<double> pb(n);
-        for (int i = 0; i < n; i++) pb[i] = b.get(pivot[i], col);
-
-        // Forward substitution: L * y = pb
-        std::vector<double> y(n);
-        for (int i = 0; i < n; i++) {
-            double sum = pb[i];
-            for (int j = 0; j < i; j++) sum -= L.get(i, j) * y[j];
-            y[i] = sum;
-        }
-
-        // Back substitution: U * x = y
-        std::vector<double> x(n);
-        for (int i = n - 1; i >= 0; i--) {
-            double sum = y[i];
-            for (int j = i + 1; j < n; j++) sum -= U.get(i, j) * x[j];
-            double uii = U.get(i, i);
-            x[i] = std::abs(uii) > 1e-14 ? sum / uii : 0.0;
-        }
-
-        for (int i = 0; i < n; i++) X.set(i, col, x[i]);
-    }
+    X.data = b.data;
+    char trans = 'N';
+    dgetrs_(&trans, &n, &nrhs, A_copy.data(), &n, ipiv.data(),
+            X.data.data(), &n, &info);
 
     return X;
 }
@@ -181,18 +168,27 @@ double MatrixN::determinant() const {
 }
 
 std::vector<double> MatrixN::solve(const std::vector<double>& b) const {
-    MatrixN bMat = MatrixN::columnVector(b);
-    MatrixN xMat = solve(bMat);
-    return xMat.getColumn(0);
+    int n = rows;
+    int one = 1;
+    std::vector<double> A_copy(data);
+    std::vector<int> ipiv(n);
+    int info = 0;
+    dgetrf_(&n, &n, A_copy.data(), &n, ipiv.data(), &info);
+
+    std::vector<double> x(b);
+    char trans = 'N';
+    dgetrs_(&trans, &n, &one, A_copy.data(), &n, ipiv.data(),
+            x.data(), &n, &info);
+    return x;
 }
 
 std::vector<double> MatrixN::multiplyVector(const std::vector<double>& x) const {
     std::vector<double> y(rows, 0.0);
-    for (int j = 0; j < cols; j++) {
-        for (int i = 0; i < rows; i++) {
-            y[i] += get(i, j) * x[j];
-        }
-    }
+    double alpha = 1.0, beta = 0.0;
+    int incx = 1, incy = 1;
+    int m = rows, n = cols;
+    dgemv_("N", &m, &n, &alpha, data.data(), &m,
+           x.data(), &incx, &beta, y.data(), &incy);
     return y;
 }
 

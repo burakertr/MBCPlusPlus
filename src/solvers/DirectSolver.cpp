@@ -2,6 +2,15 @@
 #include <cmath>
 #include <algorithm>
 
+// LAPACK Fortran interface
+extern "C" {
+    void dgetrf_(const int* m, const int* n, double* A, const int* lda,
+                 int* ipiv, int* info);
+    void dgetrs_(const char* trans, const int* n, const int* nrhs,
+                 const double* A, const int* lda, const int* ipiv,
+                 double* B, const int* ldb, int* info);
+}
+
 namespace mb {
 
 DirectSolver::DirectSolver(const SolverConfig& config, double epsilon)
@@ -70,56 +79,17 @@ SolverResult DirectSolver::solve(
     for (int i = 0; i < n; i++) b_[i] = Q[i];
     for (int i = 0; i < m; i++) b_[n + i] = gamma[i];
 
-    // ── In-place LU with partial pivoting ──
-    for (int i = 0; i < totalSize; i++) P_[i] = i;
+    // ── LAPACK LU factorization + solve ──
+    int info = 0;
+    int one = 1;
+    dgetrf_(&totalSize, &totalSize, A_.data(), &totalSize, P_.data(), &info);
 
-    for (int k = 0; k < totalSize; k++) {
-        // Find pivot in column k
-        double maxVal = std::abs(A_[k * totalSize + k]);
-        int maxRow = k;
-        for (int i = k + 1; i < totalSize; i++) {
-            double v = std::abs(A_[k * totalSize + i]);
-            if (v > maxVal) { maxVal = v; maxRow = i; }
-        }
+    // Copy RHS into x_ (dgetrs overwrites RHS in-place)
+    std::copy(b_.begin(), b_.begin() + totalSize, x_.begin());
 
-        // Swap rows
-        if (maxRow != k) {
-            std::swap(P_[k], P_[maxRow]);
-            for (int j = 0; j < totalSize; j++) {
-                int col = j * totalSize;
-                std::swap(A_[col + k], A_[col + maxRow]);
-            }
-        }
-
-        double pivot = A_[k * totalSize + k];
-        if (std::abs(pivot) < 1e-14) continue;
-
-        double invPivot = 1.0 / pivot;
-        for (int i = k + 1; i < totalSize; i++) {
-            double factor = A_[k * totalSize + i] * invPivot;
-            A_[k * totalSize + i] = factor; // store L multiplier
-            for (int j = k + 1; j < totalSize; j++) {
-                A_[j * totalSize + i] -= factor * A_[j * totalSize + k];
-            }
-        }
-    }
-
-    // ── Forward substitution: Ly = Pb ──
-    for (int i = 0; i < totalSize; i++) x_[i] = b_[P_[i]];
-    for (int i = 0; i < totalSize; i++) {
-        for (int j = 0; j < i; j++) {
-            x_[i] -= A_[j * totalSize + i] * x_[j];
-        }
-    }
-
-    // ── Backward substitution: Ux = y ──
-    for (int i = totalSize - 1; i >= 0; i--) {
-        for (int j = i + 1; j < totalSize; j++) {
-            x_[i] -= A_[j * totalSize + i] * x_[j];
-        }
-        double diag = A_[i * totalSize + i];
-        x_[i] = (std::abs(diag) > 1e-14) ? x_[i] / diag : 0.0;
-    }
+    char trans = 'N';
+    dgetrs_(&trans, &totalSize, &one, A_.data(), &totalSize, P_.data(),
+            x_.data(), &totalSize, &info);
 
     // Store for warm-starting
     lastSolution_.assign(x_.begin(), x_.end());

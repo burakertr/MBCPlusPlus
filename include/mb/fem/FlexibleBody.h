@@ -87,6 +87,18 @@ public:
     std::vector<Vec3> getNodeDisplacements() const;
     std::vector<std::array<int,4>> getTetConnectivity() const;
 
+    /// Compute von Mises stress at element centroid (Pa)
+    double computeElementVonMises(int elemIdx) const;
+
+    // ─── Element Removal (Fracture) ─────────────────────────
+
+    /// Remove elements by index. Indices need not be sorted.
+    /// Invalidates mass matrix cache automatically.
+    void removeElements(const std::vector<int>& elemIndices);
+
+    /// Invalidate cached mass matrix (call after topology changes)
+    void invalidateMassCache();
+
     // ─── Body Interface Overrides ────────────────────────────
 
     double getMass() const override { return getTotalMass(); }

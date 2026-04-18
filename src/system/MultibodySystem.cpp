@@ -1,6 +1,7 @@
 #include "mb/system/MultibodySystem.h"
 #include "mb/solvers/DirectSolver.h"
 #include "mb/integrators/RungeKutta.h"
+#include <omp.h>
 #include <cmath>
 #include <algorithm>
 #include <chrono>
@@ -74,8 +75,10 @@ void MultibodySystem::setState(const StateVector& st) {
 
 MatrixN MultibodySystem::assembleMassMatrix() const {
     MatrixN M(totalDynNv_, totalDynNv_);
+    int nDyn = (int)dynBodyIndices_.size();
 
-    for (int di = 0; di < (int)dynBodyIndices_.size(); di++) {
+    #pragma omp parallel for schedule(static)
+    for (int di = 0; di < nDyn; di++) {
         int b = dynBodyIndices_[di];
         int off = dynVOffsets_[di];
         int n = state_.nvPerBody[b];
@@ -139,9 +142,14 @@ std::vector<double> MultibodySystem::assembleForces(double t) const {
         body->clearForces();
     for (auto& force : forces_)
         force->apply(t);
+    // Apply constraint-level damping (e.g. revolute joint damping)
+    for (auto& c : constraints_)
+        c->applyDamping();
 
     // Collect generalized forces for dynamic bodies only
-    for (int di = 0; di < (int)dynBodyIndices_.size(); di++) {
+    int nDynF = (int)dynBodyIndices_.size();
+    #pragma omp parallel for schedule(static)
+    for (int di = 0; di < nDynF; di++) {
         int b = dynBodyIndices_[di];
         auto fvec = bodies_[b]->computeForces(gravity_);
         int off = dynVOffsets_[di];
@@ -369,7 +377,9 @@ void MultibodySystem::projectConstraintsPosition() {
         auto Cq = assembleJacobian();  // nc × totalDynNv_
 
         MatrixN Minv(totalDynNv_, totalDynNv_);
-        for (int di = 0; di < (int)dynBodyIndices_.size(); di++) {
+        int nDynP = (int)dynBodyIndices_.size();
+        #pragma omp parallel for schedule(static)
+        for (int di = 0; di < nDynP; di++) {
             int b = dynBodyIndices_[di];
             int off = dynVOffsets_[di];
             int n = state_.nvPerBody[b];
@@ -457,7 +467,9 @@ void MultibodySystem::projectConstraintsVelocity() {
 
     // Block-diagonal inverse mass (dynamic only)
     MatrixN Minv(totalDynNv_, totalDynNv_);
-    for (int di = 0; di < (int)dynBodyIndices_.size(); di++) {
+    int nDynV = (int)dynBodyIndices_.size();
+    #pragma omp parallel for schedule(static)
+    for (int di = 0; di < nDynV; di++) {
         int b = dynBodyIndices_[di];
         int off = dynVOffsets_[di];
         int n = state_.nvPerBody[b];
@@ -499,26 +511,38 @@ void MultibodySystem::projectConstraintsVelocity() {
 
 AnalysisResult MultibodySystem::analyze() const {
     AnalysisResult r;
-    for (auto& b : bodies_) {
-        r.kineticEnergy += b->computeKineticEnergy();
-        r.potentialEnergy += b->computePotentialEnergy(gravity_);
+    int nBodies = (int)bodies_.size();
+    double totalKE = 0, totalPE = 0;
+    double lmx = 0, lmy = 0, lmz = 0;
+    double amx = 0, amy = 0, amz = 0;
+
+    #pragma omp parallel for reduction(+:totalKE,totalPE,lmx,lmy,lmz,amx,amy,amz) schedule(static)
+    for (int bi = 0; bi < nBodies; bi++) {
+        auto& b = bodies_[bi];
+        totalKE += b->computeKineticEnergy();
+        totalPE += b->computePotentialEnergy(gravity_);
         if (b->isDynamic()) {
-            r.linearMomentum = r.linearMomentum + b->velocity * b->getMass();
-            // Angular momentum = I_world * ω + r × (m*v)
+            double m = b->getMass();
+            lmx += b->velocity.x * m;
+            lmy += b->velocity.y * m;
+            lmz += b->velocity.z * m;
             auto* rb = dynamic_cast<RigidBody*>(b.get());
             if (rb) {
                 Mat3 Iw = rb->getInertiaWorld();
-                Vec3 Lspin(
-                    Iw.get(0,0)*b->angularVelocity.x + Iw.get(0,1)*b->angularVelocity.y + Iw.get(0,2)*b->angularVelocity.z,
-                    Iw.get(1,0)*b->angularVelocity.x + Iw.get(1,1)*b->angularVelocity.y + Iw.get(1,2)*b->angularVelocity.z,
-                    Iw.get(2,0)*b->angularVelocity.x + Iw.get(2,1)*b->angularVelocity.y + Iw.get(2,2)*b->angularVelocity.z
-                );
-                Vec3 Lorbit = b->position.cross(b->velocity * b->getMass());
-                r.angularMomentum = r.angularMomentum + Lspin + Lorbit;
+                amx += Iw.get(0,0)*b->angularVelocity.x + Iw.get(0,1)*b->angularVelocity.y + Iw.get(0,2)*b->angularVelocity.z
+                      + b->position.y*(b->velocity.z*m) - b->position.z*(b->velocity.y*m);
+                amy += Iw.get(1,0)*b->angularVelocity.x + Iw.get(1,1)*b->angularVelocity.y + Iw.get(1,2)*b->angularVelocity.z
+                      + b->position.z*(b->velocity.x*m) - b->position.x*(b->velocity.z*m);
+                amz += Iw.get(2,0)*b->angularVelocity.x + Iw.get(2,1)*b->angularVelocity.y + Iw.get(2,2)*b->angularVelocity.z
+                      + b->position.x*(b->velocity.y*m) - b->position.y*(b->velocity.x*m);
             }
         }
     }
-    r.totalEnergy = r.kineticEnergy + r.potentialEnergy;
+    r.kineticEnergy = totalKE;
+    r.potentialEnergy = totalPE;
+    r.linearMomentum = Vec3(lmx, lmy, lmz);
+    r.angularMomentum = Vec3(amx, amy, amz);
+    r.totalEnergy = totalKE + totalPE;
 
     // Constraint violation
     for (auto& c : constraints_) {

@@ -19,7 +19,6 @@
 #include <QWheelEvent>
 #include <QElapsedTimer>
 #include <QFont>
-#include <QProcess>
 #include <QImage>
 #include <cmath>
 #include <vector>
@@ -30,6 +29,7 @@
 #include "mb/fem/FlexibleBody.h"
 #include "mb/fem/FlexibleIntegrators.h"
 #include "mb/fem/FlexibleContactManager.h"
+#include "mb/core/ThreadConfig.h"
 
 using namespace mb;
 
@@ -39,8 +39,6 @@ static constexpr double EA=1e7, RHO_A=1200.0;    // sert kauçuk
 static constexpr double EB=5e6, RHO_B=1000.0;    // orta sert
 static constexpr double NU = 0.3;
 static constexpr int    NSUB = 200;
-static constexpr double RECORD_DURATION = 8.0;  // saniye
-static constexpr int    RECORD_FPS = 60;
 
 // Tek tetrahedron mesh oluştur (taban altta)
 static GmshMesh makeSingleTet(double sz, double dx, double dy, double dz){
@@ -214,13 +212,6 @@ public:
         elapsed_.start();
         setFocusPolicy(Qt::StrongFocus);
         azimuth_=0.5; elevation_=0.28;
-
-        // Start ffmpeg recording
-        startRecording();
-    }
-
-    ~TetCollisionWidget(){
-        stopRecording();
     }
 
 protected:
@@ -331,19 +322,10 @@ protected:
 
 private slots:
     void tick(){
-        double dt=1.0/RECORD_FPS;
+        double dt=1.0/60.0;
         if(!paused_) sim_.step(dt);
         frameCount_++;
-        repaint();  // synchronous paint
-        // Write frame to ffmpeg after paint
-        if(recording_ && ffmpeg_ && ffmpeg_->state()==QProcess::Running){
-            QImage img=grab().toImage().convertToFormat(QImage::Format_RGBA8888);
-            ffmpeg_->write((const char*)img.constBits(), img.sizeInBytes());
-            recordedFrames_++;
-            if(recordedFrames_ >= RECORD_FPS * RECORD_DURATION){
-                stopRecording();
-            }
-        }
+        update();
     }
 
 private:
@@ -352,46 +334,6 @@ private:
     bool paused_=false; int frameCount_=0;
     double zoom_=1.0,azimuth_=0,elevation_=0,panX_=0,panY_=0;
     QPoint lastMousePos_;
-
-    // Recording
-    QProcess* ffmpeg_=nullptr;
-    bool recording_=false;
-    int recordedFrames_=0;
-
-    void startRecording(){
-        ffmpeg_=new QProcess(this);
-        QString cmd="ffmpeg";
-        QStringList args;
-        args<<"-y"
-            <<"-f"<<"rawvideo"
-            <<"-pixel_format"<<"rgba"
-            <<"-video_size"<<QString("%1x%2").arg(width()).arg(height())
-            <<"-framerate"<<QString::number(RECORD_FPS)
-            <<"-i"<<"pipe:0"
-            <<"-c:v"<<"libx264"
-            <<"-preset"<<"fast"
-            <<"-crf"<<"18"
-            <<"-pix_fmt"<<"yuv420p"
-            <<"-movflags"<<"+faststart"
-            <<"tet_collision.mp4";
-        ffmpeg_->setWorkingDirectory(QApplication::applicationDirPath());
-        ffmpeg_->start(cmd,args);
-        ffmpeg_->waitForStarted(3000);
-        recording_=true;
-        recordedFrames_=0;
-        qDebug("Recording started: %dx%d @ %d fps, %.1f s",width(),height(),RECORD_FPS,RECORD_DURATION);
-    }
-
-    void stopRecording(){
-        if(!recording_) return;
-        recording_=false;
-        if(ffmpeg_){
-            ffmpeg_->closeWriteChannel();
-            ffmpeg_->waitForFinished(10000);
-            qDebug("Recording finished: %d frames -> tet_collision.mp4",recordedFrames_);
-            ffmpeg_->deleteLater(); ffmpeg_=nullptr;
-        }
-    }
 
     void drawHUD(QPainter& p,int w,int){
         double fps=frameCount_/(elapsed_.elapsed()*0.001+1e-9);
@@ -447,6 +389,12 @@ private:
 };
 
 int main(int argc,char* argv[]){
+    // Parse -c N for thread count
+    for (int i = 1; i < argc; i++) {
+        if (std::string(argv[i]) == "-c" && i+1 < argc) {
+            ThreadConfig::setNumThreads(std::atoi(argv[++i]));
+        }
+    }
     QApplication app(argc,argv);
     TetCollisionWidget win; win.show();
     return app.exec();

@@ -52,6 +52,9 @@ public:
     // Baumgarte parameters
     void setBaumgarteParameters(double alpha, double beta);
 
+    // Damping: constraints can apply dissipative forces to bodies
+    virtual void applyDamping() {}
+
 protected:
     double alpha_ = 5.0;
     double beta_ = 5.0;
