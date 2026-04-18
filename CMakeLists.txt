@@ -98,9 +98,6 @@ if(Qt5_FOUND)
     add_executable(chain20_revolute_qt examples/chain20_revolute_qt.cpp)
     target_link_libraries(chain20_revolute_qt PRIVATE multibody Qt5::Widgets)
 
-    add_executable(mcpherson_qt examples/mcpherson_qt.cpp)
-    target_link_libraries(mcpherson_qt PRIVATE multibody Qt5::Widgets)
-
     add_executable(cantilever_qt examples/cantilever_qt.cpp)
     target_link_libraries(cantilever_qt PRIVATE multibody Qt5::Widgets)
 
