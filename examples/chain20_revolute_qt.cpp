@@ -37,7 +37,7 @@ using namespace mb;
 // ─────────────────────────────────────────────
 //  Constants
 // ─────────────────────────────────────────────
-static constexpr int N_LINKS = 10;
+static constexpr int N_LINKS = 20;
 static constexpr double LINK_LENGTH = 0.5;   // metres per link
 static constexpr double LINK_MASS   = 0.2;   // kg per link
 static constexpr double LINK_RADIUS = 0.05;  // visual rod radius

@@ -92,9 +92,6 @@ if(Qt5_FOUND)
     add_executable(pendulum_qt examples/pendulum_qt.cpp)
     target_link_libraries(pendulum_qt PRIVATE multibody Qt5::Widgets)
 
-    add_executable(chain20_qt examples/chain20_qt.cpp)
-    target_link_libraries(chain20_qt PRIVATE multibody Qt5::Widgets)
-
     add_executable(chain20_revolute_qt examples/chain20_revolute_qt.cpp)
     target_link_libraries(chain20_revolute_qt PRIVATE multibody Qt5::Widgets)
 

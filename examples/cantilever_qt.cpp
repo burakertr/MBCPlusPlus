@@ -50,9 +50,9 @@ static constexpr int    MESH_NZ   = 2;
 
 // Material (Neo-Hookean — stable under large deformation)
 // E=2e8 Pa gives ~23 cm static tip deflection (visible but no element inversion)
-static constexpr double MAT_E     = 70e4;     // Pa
+static constexpr double MAT_E     = 70e3;     // Pa
 static constexpr double MAT_NU    = 0.3;
-static constexpr double MAT_RHO   = 7800.0;  // kg/m³
+static constexpr double MAT_RHO   = 780.0;  // kg/m³
 
 // ─────────────────────────────────────────────
 //  Simulation state
@@ -80,7 +80,7 @@ struct Simulation {
         body = FlexibleBody::fromMesh(mesh, mat, "Cantilever", true);
 
         body->gravity = Vec3(0, -9.81, 0);
-        body->dampingAlpha = 10;   // light damping — settles to static equilibrium
+        body->dampingAlpha = 1;   // light damping — settles to static equilibrium
 
         // Fix the left face (x ≈ 0)
         body->fixNodesOnPlane('x', 0.0, 1e-6);
