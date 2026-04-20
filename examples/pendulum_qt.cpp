@@ -16,6 +16,8 @@
 #include <QMouseEvent>
 #include <QElapsedTimer>
 #include <QFont>
+#include <QProcess>
+#include <QImage>
 #include <cmath>
 #include <deque>
 
@@ -117,7 +119,7 @@ struct Simulation {
 // ─────────────────────────────────────────────
 class PendulumWidget : public QWidget {
 public:
-    PendulumWidget(QWidget* parent = nullptr) : QWidget(parent) {
+    PendulumWidget(bool record = false, QWidget* parent = nullptr) : QWidget(parent), recording_(record) {
         setWindowTitle("MBC++ — Çift Sarkaç");
         resize(900, 750);
         setMinimumSize(600, 500);
@@ -127,6 +129,21 @@ public:
         // Trace ring-buffer
         traceMax_ = 3000;
 
+        if (recording_) {
+            ffmpeg_ = new QProcess(this);
+            QStringList args;
+            args << "-y" << "-f" << "rawvideo" << "-pixel_format" << "bgra"
+                 << "-video_size" << QString("%1x%2").arg(width()).arg(height())
+                 << "-framerate" << "60"
+                 << "-i" << "pipe:0"
+                 << "-c:v" << "libx264" << "-preset" << "fast"
+                 << "-crf" << "18" << "-pix_fmt" << "yuv420p"
+                 << "double_pendulum_sim.mp4";
+            ffmpeg_->start("ffmpeg", args);
+            ffmpeg_->waitForStarted();
+            printf("[REC] Recording to double_pendulum_sim.mp4 (%dx%d @60fps)\n", width(), height());
+        }
+
         // Timer → ~60 FPS
         timer_ = new QTimer(this);
         connect(timer_, &QTimer::timeout, this, &PendulumWidget::tick);
@@ -134,6 +151,10 @@ public:
 
         elapsed_.start();
         setFocusPolicy(Qt::StrongFocus);
+    }
+
+    ~PendulumWidget() override {
+        stopRecording();
     }
 
 protected:
@@ -307,6 +328,13 @@ private slots:
         }
         frameCount_++;
         update();
+
+        if (recording_ && ffmpeg_ && ffmpeg_->state() == QProcess::Running) {
+            QImage img(size(), QImage::Format_ARGB32);
+            img.fill(Qt::black);
+            render(&img);
+            ffmpeg_->write((const char*)img.constBits(), img.sizeInBytes());
+        }
     }
 
 private:
@@ -318,6 +346,17 @@ private:
     int  frameCount_ = 0;
     int  traceMax_;
     std::deque<Vec3> trace_;
+    bool recording_ = false;
+    QProcess* ffmpeg_ = nullptr;
+
+    void stopRecording() {
+        if (ffmpeg_ && ffmpeg_->state() == QProcess::Running) {
+            ffmpeg_->closeWriteChannel();
+            ffmpeg_->waitForFinished(5000);
+            printf("[REC] Saved double_pendulum_sim.mp4\n");
+            ffmpeg_ = nullptr;
+        }
+    }
 
     // ── Grid ──
     void drawGrid(QPainter& p, double cx, double cy, double ppm, int w, int h) {
@@ -379,15 +418,18 @@ private:
 
 // ─────────────────────────────────────────────
 int main(int argc, char* argv[]) {
+    bool record = false;
     // Parse -c N for thread count
     for (int i = 1; i < argc; i++) {
         if (std::string(argv[i]) == "-c" && i+1 < argc) {
             ThreadConfig::setNumThreads(std::atoi(argv[++i]));
+        } else if (std::string(argv[i]) == "-r") {
+            record = true;
         }
     }
 
     QApplication app(argc, argv);
-    PendulumWidget win;
+    PendulumWidget win(record);
     win.show();
     return app.exec();
 }

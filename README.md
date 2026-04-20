@@ -2,6 +2,10 @@
 
 A modern C++17 library for **rigid multibody dynamics** and **flexible-body finite-element analysis** using the Absolute Nodal Coordinate Formulation (ANCF). Includes real-time Qt5 visualization, contact/collision handling, and a rich set of time integrators.
 
+<p align="center">
+  <img src="output.gif" alt="MBC++ Simulation Example" width="700"/>
+</p>
+
 ---
 
 ## Features
