@@ -113,6 +113,17 @@ if(Qt5_FOUND)
     add_executable(bending_fracture_qt examples/bending_fracture_qt.cpp)
     target_link_libraries(bending_fracture_qt PRIVATE multibody Qt5::Widgets)
 
+    # OpenCASCADE (STEP okuma + tessellation)
+    set(OCCT_INC /usr/include/opencascade)
+    set(OCCT_LIBS
+        TKDESTEP TKXCAF TKCAF TKCDF TKBRep TKernel TKMath TKG2d TKG3d
+        TKGeomBase TKGeomAlgo TKXSBase TKDE TKDECascade TKMesh TKTopAlgo
+        TKLCAF TKVCAF TKBO TKShHealing)
+
+    add_executable(assembly_dynamics_qt examples/assembly_dynamics_qt.cpp)
+    target_include_directories(assembly_dynamics_qt PRIVATE ${OCCT_INC})
+    target_link_libraries(assembly_dynamics_qt PRIVATE multibody Qt5::Widgets ${OCCT_LIBS})
+
     message(STATUS "Qt5 found – building all Qt demos")
 else()
     message(STATUS "Qt5 not found – skipping pendulum_qt")
