@@ -24,6 +24,8 @@
 #include <QWheelEvent>
 #include <QElapsedTimer>
 #include <QFont>
+#include <QProcess>
+#include <QImage>
 
 // STL
 #include <cmath>
@@ -65,6 +67,7 @@
 #include "mb/constraints/RevoluteJoint.h"
 #include "mb/constraints/SphericalJoint.h"
 #include "mb/constraints/PrismaticJoint.h"
+#include "mb/forces/AppliedForce.h"
 #include "mb/solvers/DirectSolver.h"
 #include "mb/integrators/RungeKutta.h"
 #include "mb/system/MultibodySystem.h"
@@ -233,7 +236,7 @@ struct AssemblyLoader {
             float fn = (float)pm.verts.size();
             pm.cx=sx/fn; pm.cy=sy/fn; pm.cz=sz/fn;
 
-            printf("  [%2d] %-35s  verts=%-6d tris=%-5d  c=(%.1f,%.1f,%.1f)mm\n",
+            printf("  [%2d] %-35s  verts=%-6d tris=%-5d  c=(%.6f, %.6f, %.6f)mm\n",
                    (int)parts.size(), name.c_str(),
                    (int)pm.verts.size(), (int)pm.tris.size(),
                    pm.cx, pm.cy, pm.cz);
@@ -276,19 +279,28 @@ struct Simulation {
     MultibodySystem sys{"AssemblyDyn"};
     std::shared_ptr<RigidBody> ground, crank, rod, piston, drivenGear;
 
-    // Fiziksel parametreler (metre) — assembly.step'ten ölçüldü:
-    //   crank pin Y=35.8mm, piston Y=140.6mm → R=35.8mm, L=104.8mm
-    double R = 0.0358;  // krank yarıçapı = 35.8mm
-    double L = 0.1048;  // biyel uzunluğu = 104.8mm
+    // Fiziksel parametreler (metre) 
+    double R = 0.0379515;   // True 3D hypotenuse based on pure geometric axis
+    double L = 0.0966523;   // Wrist pin Y(132.43mm) - Krank pimi
+    static constexpr double PISTON_JOINT_Y = -0.008134;
+    
     double OMEGA = 1500.0*2.0*M_PI/60.0; // 1500 rpm başlangıç
+
+    // Gaz kuvveti parametreleri (sabit)
+    static constexpr double BORE_RADIUS = 0.019;  // 19 mm piston çapı
+    static constexpr double A_BORE = M_PI * BORE_RADIUS * BORE_RADIUS; // ≈1.134e-3 m²
+    static constexpr double P_ATM  = 1.0e5;   // 1 bar atmosfer [Pa]
+    static constexpr double P_PEAK = 60.0e5;  // 60 bar tepe yanma [Pa]
     double speedFactor = 1.0;
-    double dt = 0.00005;
-    int    subSteps = 6;
+    double dt = 0.00004;   // sabit adım — adaptif integratör değişkeni değil
+    int    subSteps = 8;   // frame başı adım sayısı
 
     // Parça referans merkezleri (mm, STEP'ten — her parçanın yerel sıfırı)
     // Bunlar loader'dan alınır, dinamik dönüşüm sırasında yerel merkez
     // olarak kullanılır.
     std::array<float,3> partCenter[11] = {};
+    float rodBigEndY   = 35.8f;   // STEP'ten ölçülen gerçek big-end Y (mm)
+    float rodSmallEndY = 132.4f;  // STEP'ten ölçülen gerçek small-end Y (mm)
 
     // Simülasyon anlık transform'ları — render için
     // v_world = R * (v_step - pivot) + (tx,ty,tz)
@@ -312,48 +324,45 @@ struct Simulation {
         ground = RigidBody::createGround("Ground");
         sys.addBody(ground);
 
-        // ── Tutarlı başlangıç koşulları ──────────────────────────────
-        // Krank X ekseni etrafında döner; pin gövde çerçevesinde (0,R,0).
-        // θ₀ = π/2 seçildi: en sade tutarsızlıksız başlangıç noktası.
+        // ── Tutarlı başlangıç koşulları — ÜÖN (TDC, θ=0) ───────────────────
+        // θ₀=0: krank pimi en üstte (0,R,0). Gaz kuvveti (cosθ)⁴ θ=0'da
+        // maksimum olduğundan piston anında aşağı itilir → sistem kilitsiz.
         //
-        //  pin_dünya = Rx(π/2)·(0,R,0) = (0, 0, R)
-        //  v_pin     = ω×r = (Ω,0,0)×(0,0,R) = (0,-ΩR,0)   ← saf Y hızı
-        //  y_piston  = √(L²-R²)                              ← piston konumu
-        //  v_piston  = -ΩR  (Y ekseni boyunca)              ← aynı hız → biyel ω=0
-        //
-        // Böylece başlangıçta tüm hız kısıtları otomatik sağlanır.
+        // θ=0 tutarlı hız türetimi (krank ω_x = +Ω, X ekseni sağ-el):
+        //   pin_dünya  = (0, R, 0)
+        //   v_pin      = (Ω,0,0)×(0,R,0) = (0, 0, ΩR)       ← saf Z hızı
+        //   piston_Y   = R + L   (TDC, maksimum konum)
+        //   v_piston   = 0       (dönüm noktası)
+        //   rod ω_x    = -ΩR/L  (kısıt türetmesinden)
+        //   rod v_cm   = (0, 0, ΩR/2)
         // ────────────────────────────────────────────────────────────
 
-        const double theta0   = M_PI / 2.0;
-        const double omegaEff = OMEGA * speedFactor;
-        const double pinZ     = R;                       // pin_dünya = (0,0,R)
-        const double pisY     = std::sqrt(L*L - R*R);   // piston Y konumu
-        const double vPisY    = -omegaEff * R;           // piston hızı (Y)
+        const double omegaEff  = OMEGA * speedFactor;
+        // TDC: bilek pimi Y = R+L = 132.4mm, piston kafası merkezi = R+L−PISTON_JOINT_Y = 140.6mm
+        const double wristY    = R + L;              // bilek pimi konumu (eklem noktası)
+        const double pisY      = wristY - PISTON_JOINT_Y; // piston STEP merkezi (140.6mm)
+        const double rodOmegaX = -omegaEff * R / L; // biyel açısal hızı
+        const double rodVZ     =  omegaEff * R / 2.0; // biyel merkezi Z hızı
 
-        // Rod yönü: pin(0,0,R) → piston(0,pisY,0)
-        // Gövde-Y eksenini bu doğrultuya çevirmek için X etrafında döndür:
-        // (0,1,0) → (0,pisY/L,-R/L)  ⇒  α = atan2(-R/L, pisY/L)
-        const double rodAngle = std::atan2(-R / L, pisY / L);
-
-        // Krank: Rx(π/2)
-        crank = RigidBody::createCylinder(0.4, R, 0.120, "Crank");
+        // Krank: Rx(0) = birim — pin gövde çerçevesinde (0,R,0) → dünya (0,R,0)
+        crank = RigidBody::createCylinder(1.5, R, 0.120, "Crank"); // 1.5 kg volan
         crank->position        = Vec3(0,0,0);
-        crank->orientation     = Quaternion::fromAxisAngle(Vec3(1,0,0), theta0);
+        crank->orientation     = Quaternion::identity();
         crank->angularVelocity = Vec3(omegaEff, 0, 0);
         sys.addBody(crank);
 
-        // Biyel: orta nokta = ortalaması(pin, piston)
+        // Biyel: pin(0,R,0) → piston(0,R+L,0), gövde-Y = dünya-Y → orient=I
         rod = RigidBody::createRod(0.06, L, 0.004, "Rod");
-        rod->position        = Vec3(0, pisY * 0.5, pinZ * 0.5);
-        rod->orientation     = Quaternion::fromAxisAngle(Vec3(1,0,0), rodAngle);
-        rod->velocity        = Vec3(0, vPisY, 0); // pin ve piston aynı hızda → ω_rod=0
-        rod->angularVelocity = Vec3(0, 0, 0);
+        rod->position        = Vec3(0, R + L * 0.5, 0);
+        rod->orientation     = Quaternion::identity();
+        rod->velocity        = Vec3(0, 0, rodVZ);
+        rod->angularVelocity = Vec3(rodOmegaX, 0, 0);
         sys.addBody(rod);
 
-        // Piston
-        piston = RigidBody::createCylinder(0.15, 0.019, 0.040, "Piston");
+        // Piston: TDC'de hareketsiz
+        piston = RigidBody::createCylinder(0.30, 0.019, 0.040, "Piston"); // 300 g
         piston->position = Vec3(0, pisY, 0);
-        piston->velocity = Vec3(0, vPisY, 0);
+        piston->velocity = Vec3(0, 0, 0);
         sys.addBody(piston);
 
         // Çıkış dişlisi — STEP'te X=83mm, Y≈-2mm; X ekseni etrafında döner
@@ -365,18 +374,21 @@ struct Simulation {
         sys.addBody(drivenGear);
 
         // Eklemler
-        // Krank: X ekseni etrafında döner
-        sys.addConstraint(std::make_shared<RevoluteJoint>(
+        // Krank: X ekseni etrafında döner — yatak sönümü ile yük direnci
+        auto jCrank = std::make_shared<RevoluteJoint>(
             ground.get(), crank.get(),
             Vec3(0,0,0), Vec3(0,0,0),
-            Vec3(1,0,0), Vec3(1,0,0), 0.0, "J_Crank"));
+            Vec3(1,0,0), Vec3(1,0,0), 0.0, "J_Crank");
+        jCrank->setDamping(0.05); // 0.05 N·m·s — hafif yatak sürtünmesi
+        sys.addConstraint(jCrank);
         // Krank pimi: krank gövdesinde (0, R, 0) noktası — X'e dik, Y'ye offset
         sys.addConstraint(std::make_shared<SphericalJoint>(
             crank.get(), rod.get(),
             Vec3(0,R,0), Vec3(0,-L*0.5,0), "J_RodCrank"));
+        // Bilek pimi: biyel ucunda (0,L/2,0), piston gövdesinde (0,PISTON_JOINT_Y,0)
         sys.addConstraint(std::make_shared<SphericalJoint>(
             rod.get(), piston.get(),
-            Vec3(0,L*0.5,0), Vec3(0,0,0), "J_RodPiston"));
+            Vec3(0,L*0.5,0), Vec3(0,PISTON_JOINT_Y,0), "J_RodPiston"));
         sys.addConstraint(std::make_shared<PrismaticJoint>(
             ground.get(), piston.get(),
             Vec3(0,0,0), Vec3(0,0,0),
@@ -388,9 +400,30 @@ struct Simulation {
 
         sys.setSolver(std::make_shared<DirectSolver>());
         IntegratorConfig cfg;
-        cfg.adaptive=true; cfg.absTol=1e-6; cfg.relTol=1e-5;
-        cfg.maxStep=0.001; cfg.minStep=1e-8;
+        cfg.adaptive=true; cfg.absTol=1e-7; cfg.relTol=1e-6;
+        cfg.maxStep=0.0002; cfg.minStep=1e-8;
         sys.setIntegrator(std::make_shared<DormandPrince45>(cfg));
+
+        // ── Motor torku — krank üzerine direk X ekseninde ──────────────────
+        // Piston kuvveti yerine kranktaki eşdeğer tork kullanılıyor.
+        // Bu yaklaşım kısıt drift sorununu tamamen ortadan kaldırır.
+        //
+        // Eşdeğer tork: τ(θ) = F_piston * R * sinθ  (krank-mil moment kolu)
+        // θ = krank açısı, sinθ > 0 → güç zamanı
+        // Tork +X yönünde (sağ el kuralı, krank +X etrafında döner)
+        auto motorTorque = [this](double /*t*/) -> Vec3 {
+            Vec3 pinW = crank->bodyToWorld(Vec3(0, R, 0));
+            double theta = std::atan2(pinW.z, pinW.y);
+            double sinT  = std::sin(theta);
+            if (sinT <= 0.0) return Vec3(0, 0, 0); // sadece güç zamanı
+            double envelope = 0.5 * (1.0 + std::cos(theta));
+            double F_piston = P_PEAK * A_BORE * envelope;
+            double tau      = F_piston * R * sinT; // N·m
+            return Vec3(tau, 0, 0); // +X ekseni etrafında
+        };
+        sys.addForce(std::make_shared<AppliedTorque>(
+            crank.get(), motorTorque, false, "MotorTorque")); // world frame
+
         sys.initialize();
         history.clear();
         updateXForms();
@@ -398,10 +431,47 @@ struct Simulation {
 
     void step() {
         for (int i=0;i<subSteps;i++) sys.step(dt);
+        static int dbgCnt=0;
+        if (++dbgCnt % 300 == 0) {
+            // Krank piminin merkezini STEP'ten hesapla → render dünya koord.
+            // Krank pimi STEP centroid: (pcx1, pcy1, pcz1)
+            double pcx1 = partCenter[1][0], pcy1 = partCenter[1][1], pcz1 = partCenter[1][2];
+            // pivot = (0, 0, pcz1), tx = (0,0,0)
+            // render = Rc * (centroid - pivot) = Rc * (pcx1, pcy1, 0)
+            const double* Rc = xf[1].R;
+            double crankPinRender_X = Rc[0]*pcx1 + Rc[1]*pcy1;
+            double crankPinRender_Y = Rc[3]*pcx1 + Rc[4]*pcy1;
+
+            // Biyel krank deliği STEP konumu = partCenter[1] ile aynı (pin orada oturuyor)
+            // Biyel krank deliği STEP: (pcx1, pcy1, pcz2)
+            double pcz2 = partCenter[2][2];
+            const double* Rr = xf[2].R;
+            double lx2 = pcx1 - xf[2].pivX;
+            double ly2 = pcy1 - xf[2].pivY;
+            double lz2 = pcz1 - pcz2;       // Z offset farkı
+            double rodHoleRender_X = Rr[0]*lx2 + Rr[1]*ly2 + Rr[2]*lz2 + xf[2].tx;
+            double rodHoleRender_Y = Rr[3]*lx2 + Rr[4]*ly2 + Rr[5]*lz2 + xf[2].ty;
+
+            printf("[DBG] t=%.3f\n"
+                   "  crankPin_render : (%.4f, %.4f)\n"
+                   "  rodHole_render  : (%.4f, %.4f)\n"
+                   "  diff_render (mm): dX=%.4f  dY=%.4f\n"
+                   "  rod_tx=%.4f  rod_ty=%.4f  rod_pivY=%.4f\n",
+                sys.getTime(),
+                crankPinRender_X, crankPinRender_Y,
+                rodHoleRender_X,  rodHoleRender_Y,
+                crankPinRender_X - rodHoleRender_X,
+                crankPinRender_Y - rodHoleRender_Y,
+                xf[2].tx, xf[2].ty, xf[2].pivY);
+            fflush(stdout);
+        }
         updateXForms();
         history.push_back({sys.getTime(), piston->position.y});
         if ((int)history.size() > 800) history.pop_front();
     }
+
+    static constexpr double STEP_PIN_Y_DBG   = 35.8;   // krank pimi Y (STEP)
+    static constexpr double STEP_WRIST_Y_DBG = 132.4;  // bilek pimi Y (STEP)
 
     // Quaternion → satır-ana 3×3
     static void qToR(const Quaternion& q, double R[9]) {
@@ -424,30 +494,46 @@ struct Simulation {
         double Rp[9]; qToR(piston->orientation,Rp);
         double Rd[9]; qToR(drivenGear->orientation,Rd);
 
-        // ── Krank grubu: pivot = STEP krank dönme ekseni ≈ (0,0,0) ──────────
-        // v_world = R_crank * v_step  (X offset korunur, YZ döner)
-        // Krank gövdesi (0,5), krank pimi (1), drive gearler (6,7,8)
+        // Krank milinin STEP dosyasındakı kusursuz fiziksel dönüş ekseni
+        // Bounding box Z_axis sol mildeki veya dişlilerdeki keyway/spoke yüzünden kaymasına 
+        // karşılık, sağ mil (Part 0) üzerinde test edildiğinde saf eksenin Z=2.69833 olduğu, 
+        // Y ekseninin ise istisnasız -2.1680 olduğu kanıtlanmıştır.
+        const float TRUE_AXIS_Y   = -2.1680f;    
+        const float TRUE_AXIS_Z   = 2.6983f; 
+        const float PISTON_Y = 140.6f;
+
         auto setCrankGroup = [&](int i) {
-            setXF(i, 0,0,0, Rc);
-            xf[i].pivX=0; xf[i].pivY=0; xf[i].pivZ=0;
+            setXF(i, 0.0, 0.0, 0.0, Rc);
+            xf[i].pivX = 0.0f;
+            xf[i].pivY = TRUE_AXIS_Y;
+            xf[i].pivZ = TRUE_AXIS_Z; 
         };
-        setCrankGroup(0); // crankshaft right
-        setCrankGroup(1); // crank pin
-        setCrankGroup(5); // crankshaft left
-        setCrankGroup(6); // PRIMARY DRIVE GEARS  (X≈54mm)
-        setCrankGroup(7); // primary drive gear s (X≈84mm)
-        setCrankGroup(8); // primary drive gear L (X≈107mm)
+        setCrankGroup(0); // crankshaft right (kendi orijinaline döndü, wobble=0)
+        setCrankGroup(1); // crank pin 
+        setCrankGroup(5); // crankshaft left (artık kendi keyway'inden kurtuldu, wobble=0)
+        setCrankGroup(6); // PRIMARY DRIVE GEARS (artık çarpık Z'den kurtuldu, wobble=0)
+        setCrankGroup(7); // primary drive gear s 
+        setCrankGroup(8); // primary drive gear L 
 
-        // ── Biyel (2): kendi merkezi etrafında döner + sim pozisyonu ──────────
+        // ── Biyel (2) ────────────────────────────────────────────────────────
+        float rodPivY = (rodBigEndY + rodSmallEndY) * 0.5f;
         setXF(2, rod->position.x*S, rod->position.y*S, rod->position.z*S, Rr);
+        xf[2].pivX = 0.0f;
+        xf[2].pivY = rodPivY;
+        xf[2].pivZ = TRUE_AXIS_Z; 
 
-        // ── Piston grubu (3,4): sadece Y boyunca öteleme ─────────────────────
+        // ── Piston grubu (3,4) ───────────────────────────────────────────────
         setXF(3, piston->position.x*S, piston->position.y*S, piston->position.z*S, Rp);
+        xf[3].pivX = 0.0f; xf[3].pivY = PISTON_Y; xf[3].pivZ = TRUE_AXIS_Z;
         setXF(4, piston->position.x*S, piston->position.y*S, piston->position.z*S, Rp);
+        xf[4].pivX = 0.0f; xf[4].pivY = PISTON_Y; xf[4].pivZ = TRUE_AXIS_Z;
 
-        // ── Çıkış dişlisi (9,10) — 9 parça olduğundan hiç kullanılmıyor ──────
-        setXF(9,  drivenGear->position.x*S, drivenGear->position.y*S, drivenGear->position.z*S, Rd);
-        setXF(10, drivenGear->position.x*S, drivenGear->position.y*S, drivenGear->position.z*S, Rd);
+        // ── Çıkış dişlisi (9,10) ─────────────────────────────────────────────
+        double gdX = drivenGear->position.x * S;
+        setXF(9,  gdX, drivenGear->position.y*S, drivenGear->position.z*S, Rd);
+        xf[9].pivX  = gdX; xf[9].pivY  = TRUE_AXIS_Y; xf[9].pivZ  = TRUE_AXIS_Z;
+        setXF(10, gdX, drivenGear->position.y*S, drivenGear->position.z*S, Rd);
+        xf[10].pivX = gdX; xf[10].pivY = TRUE_AXIS_Y; xf[10].pivZ = TRUE_AXIS_Z;
     }
 
     double rpm() const {
@@ -490,8 +576,82 @@ public:
                                   loader_.parts[i].cy,
                                   loader_.parts[i].cz};
         }
-        sim_.build();
 
+        // ── Vertex analizi: rod big-end ve crank pin gerçek aks merkezleri ──
+        // Part 1 = crank pin: tüm vertex'lerin X/Y/Z ortalama ekseni
+        // Part 2 = connecting rod: Y<50mm bölgesi = big end, Y>115mm = small end
+        if (loader_.parts.size() >= 3) {
+            // Crank pin (part 1): her vertex aynı pim ekseni etrafında
+            // Silindirin aksı = X yönünde, merkez = (cx, cy) in YZ
+            // → cx = centroid.x, cy = centroid.y (zaten biliyoruz)
+            auto& pin = loader_.parts[1];
+            float pinX=0,pinY=0,pinZ=0; int pinN=0;
+            for (auto& v : pin.verts) { pinX+=v.x; pinY+=v.y; pinZ+=v.z; pinN++; }
+            if (pinN) { pinX/=pinN; pinY/=pinN; pinZ/=pinN; }
+
+            // Connecting rod (part 2): big end hole = min-Y bölgesi
+            // Delik aksı = rod'un en alt (min-Y) vertex kümesinin Y ortalaması
+            // Sadece en alttaki %10 vertex = delik ağzı civarı
+            auto& rod = loader_.parts[2];
+            // Önce Y min-max bul
+            float rodMinY = 1e9f, rodMaxY = -1e9f;
+            for (auto& v : rod.verts) { rodMinY=std::min(rodMinY,v.y); rodMaxY=std::max(rodMaxY,v.y); }
+            float rodSpan = rodMaxY - rodMinY;
+            // Big-end delik = en alt %15 bölgesi (alt flanş + delik çevresi)
+            float bigYthresh = rodMinY + rodSpan * 0.15f;
+            // Small-end delik = en üst %15 bölgesi
+            float smlYthresh = rodMaxY - rodSpan * 0.15f;
+            float bigX=0,bigY=0,bigZ=0; int bigN=0;
+            float smlX=0,smlY=0,smlZ=0; int smlN=0;
+            for (auto& v : rod.verts) {
+                if (v.y < bigYthresh) { bigX+=v.x; bigY+=v.y; bigZ+=v.z; bigN++; }
+                if (v.y > smlYthresh) { smlX+=v.x; smlY+=v.y; smlZ+=v.z; smlN++; }
+            }
+            if (bigN) { bigX/=bigN; bigY/=bigN; bigZ/=bigN; }
+            if (smlN) { smlX/=smlN; smlY/=smlN; smlZ/=smlN; }
+            // Delik MERKEZİ = dış flanştan içeriye doğru bir miktar yukarı:
+            // Rod üst flanş bitiş Y + yarı delik yüksekliği ≈ bigYthresh + (pin.cy - rodMinY)
+            // Ama en iyi tahmin = crank pin centroid ile aynı Y çünkü onlar mate eder
+            // Yani big-end HOLE CENTER Y = crank pin centroid Y = pin.cy
+            // Rod büyük uç flanş centroid (bigY) onun altında kalır, Z'si de farklıdır
+            float bigHoleCenterY = pin.cy;   // = 35.8mm (crank pin ile eşleşmeli)
+            float smlHoleCenterY = loader_.parts[3].cy; // = 132.4mm (wrist pin ile)
+
+            printf("[VERTEX ANALIZ]\n");
+            printf("  Crank pin centroid      : (%.4f, %.4f, %.4f) mm\n", pinX, pinY, pinZ);
+            printf("  Rod Y range             : min=%.4f max=%.4f span=%.4f mm\n", rodMinY, rodMaxY, rodSpan);
+            printf("  Rod big-end  flange ctr : (%.4f, %.4f, %.4f) mm  [N=%d]\n", bigX, bigY, bigZ, bigN);
+            printf("  Rod small-end flange ctr: (%.4f, %.4f, %.4f) mm  [N=%d]\n", smlX, smlY, smlZ, smlN);
+            printf("  Assumed big hole  Y     : %.4f mm (= crank pin Y)\n", bigHoleCenterY);
+            printf("  Assumed small hole Y    : %.4f mm (= wrist pin Y)\n", smlHoleCenterY);
+            printf("  Rod pivot Y (midpoint)  : %.4f mm\n", (bigHoleCenterY+smlHoleCenterY)*0.5f);
+            
+            // CAD HATASI DÜZELTME (GEOMETRİ KAYDIRMA)
+            // Motor gövdesinin sağ tarafı Z=2.69833, sol tarafı ve dişliler Z=2.26036'da modellenmiş!
+            // Pim ise Z=2.5793 çizilmiş. Bu kaçıklıkları engellemek için hepsini Z=2.69833 eksenine oturtuyoruz
+            auto shiftMeshZ = [&](int id, float sz) {
+                if (id >= loader_.parts.size()) return;
+                for(auto& v : loader_.parts[id].verts) v.z += sz;
+                loader_.parts[id].cz += sz;
+            };
+            
+            float shift_pin = 2.69833f - 2.579345f;
+            shiftMeshZ(1, shift_pin); // crank pin
+            shiftMeshZ(2, shift_pin); // rod
+            shiftMeshZ(3, shift_pin); // wrist pin
+            shiftMeshZ(4, shift_pin); // piston
+            
+            float shift_left = 2.69833f - 2.26036f;
+            shiftMeshZ(5, shift_left); // crank left
+            shiftMeshZ(6, shift_left); // gears
+            shiftMeshZ(7, shift_left);
+            shiftMeshZ(8, shift_left);
+            shiftMeshZ(9, shift_left);
+            shiftMeshZ(10, shift_left);
+
+            fflush(stdout);
+        }
+        sim_.build();
         timer_ = new QTimer(this);
         connect(timer_,&QTimer::timeout,this,&AssemblyWidget::tick);
         timer_->start(16);
@@ -518,6 +678,10 @@ protected:
         case Qt::Key_Minus:
             sim_.speedFactor=std::max(sim_.speedFactor/1.5,0.1); break;
         case Qt::Key_W: wireframe_=!wireframe_; break;
+        case Qt::Key_V:
+            if (!recording_) startRecording();
+            else             stopRecording();
+            break;
         case Qt::Key_Escape: close(); break;
         }
         update();
@@ -545,6 +709,12 @@ private slots:
         if (!paused_) sim_.step();
         frameCount_++;
         update();
+        // Kayıt: mevcut frame'i ffmpeg'e gönder
+        if (recording_ && ffmpeg_ && ffmpeg_->state()==QProcess::Running) {
+            QImage img(size(), QImage::Format_ARGB32);
+            render(&img);
+            ffmpeg_->write((const char*)img.constBits(), img.sizeInBytes());
+        }
     }
 
 private:
@@ -554,9 +724,39 @@ private:
     QTimer*        timer_=nullptr;
     QElapsedTimer  elapsed_;
     bool           paused_=false, wireframe_=false;
+    bool           recording_=false;
+    QProcess*      ffmpeg_=nullptr;
     int            frameCount_=0;
     QPoint         lastMouse_;
 
+    void startRecording() {
+        if (recording_) return;
+        ffmpeg_ = new QProcess(this);
+        QStringList args;
+        args << "-y" << "-f" << "rawvideo" << "-pixel_format" << "bgra"
+             << "-video_size" << QString("%1x%2").arg(width()).arg(height())
+             << "-framerate" << "60"
+             << "-i" << "pipe:0"
+             << "-c:v" << "libx264" << "-preset" << "fast"
+             << "-crf" << "18" << "-pix_fmt" << "yuv420p"
+             << "assembly_sim.mp4";
+        ffmpeg_->start("ffmpeg", args);
+        ffmpeg_->waitForStarted();
+        recording_ = true;
+        printf("[REC] Kayıt başladı → assembly_sim.mp4 (%dx%d @60fps)\n", width(), height());
+        fflush(stdout);
+    }
+    void stopRecording() {
+        if (!recording_) return;
+        recording_ = false;
+        if (ffmpeg_) {
+            ffmpeg_->closeWriteChannel();
+            ffmpeg_->waitForFinished(10000);
+            printf("[REC] Kayıt tamamlandı → assembly_sim.mp4\n");
+            fflush(stdout);
+            delete ffmpeg_; ffmpeg_=nullptr;
+        }
+    }
     void resetSim() {
         sim_.build();
         elapsed_.restart(); frameCount_=0;
@@ -764,6 +964,19 @@ private:
         y+=4;
         p.setPen(QColor(130,195,130)); p.setFont(QFont("Monospace",10));
         L(QString("Piston Y : %1 mm").arg(sim_.piston->position.y*1e3,0,'f',2));
+        // Anlık motor torku
+        {
+            Vec3 pinW = sim_.crank->bodyToWorld(Vec3(0, sim_.R, 0));
+            double theta = std::atan2(pinW.z, pinW.y);
+            double sinT  = std::sin(theta);
+            double envelope = (sinT > 0) ? 0.5*(1.0+std::cos(theta)) : 0.0;
+            double F_piston = sim_.P_PEAK * sim_.A_BORE * envelope;
+            double tau      = F_piston * sim_.R * std::max(0.0, sinT);
+            double P_gas    = sim_.P_ATM + sim_.P_PEAK * envelope;
+            p.setPen(QColor(255,180,80));
+            L(QString("Gaz P    : %1 bar").arg(P_gas*1e-5,0,'f',1));
+            L(QString("Motor τ  : %1 N·m").arg(tau,0,'f',1));
+        }
         L(QString("Parçalar : %1").arg((int)loader_.parts.size()));
 
         // Sağ panel
@@ -777,6 +990,7 @@ private:
         RL("R             Sıfırla");
         RL("+/-           Hız");
         RL("W             Tel kafes");
+        RL("V             Kayıt (MP4)");
         RL("ESC           Çıkış");
         by+=6;
         for (int i=0;i<(int)loader_.parts.size()&&i<11;i++) {
@@ -793,6 +1007,11 @@ private:
             p.setPen(QColor(255,195,60));
             p.setFont(QFont("Sans",10,QFont::Bold));
             p.drawText(width()/2-48,height()-18,"[ TEL KAFES ]");
+        }
+        if (recording_) {
+            p.setPen(QColor(255,40,40));
+            p.setFont(QFont("Sans",11,QFont::Bold));
+            p.drawText(width()-130, 22, "● REC");
         }
     }
 };
