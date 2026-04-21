@@ -23,6 +23,7 @@
 #include <QWheelEvent>
 #include <QElapsedTimer>
 #include <QFont>
+#include <QProcess>
 #include <cmath>
 #include <vector>
 #include <array>
@@ -50,7 +51,7 @@ static constexpr int    MESH_NZ   = 2;
 
 // Material (Neo-Hookean — stable under large deformation)
 // E=2e8 Pa gives ~23 cm static tip deflection (visible but no element inversion)
-static constexpr double MAT_E     = 70e3;     // Pa
+static constexpr double MAT_E     = 70e4;     // Pa
 static constexpr double MAT_NU    = 0.3;
 static constexpr double MAT_RHO   = 780.0;  // kg/m³
 
@@ -153,12 +154,28 @@ static QColor heatmap(double t) {
 // ─────────────────────────────────────────────
 class CantileverWidget : public QWidget {
 public:
-    CantileverWidget(QWidget* parent = nullptr) : QWidget(parent) {
+    CantileverWidget(bool record = false, QWidget* parent = nullptr)
+        : QWidget(parent), recording_(record) {
         setWindowTitle("MBC++ — ANCF Cantilever Beam");
         resize(1200, 700);
         setMinimumSize(900, 500);
 
         sim_.build();
+
+        if (recording_) {
+            ffmpeg_ = new QProcess(this);
+            QStringList args;
+            args << "-y" << "-f" << "rawvideo" << "-pixel_format" << "bgra"
+                 << "-video_size" << QString("%1x%2").arg(width()).arg(height())
+                 << "-framerate" << "60"
+                 << "-i" << "pipe:0"
+                 << "-c:v" << "libx264" << "-preset" << "fast"
+                 << "-crf" << "18" << "-pix_fmt" << "yuv420p"
+                 << "cantilever_sim.mp4";
+            ffmpeg_->start("ffmpeg", args);
+            ffmpeg_->waitForStarted();
+            printf("[REC] Recording to cantilever_sim.mp4 (%dx%d @60fps)\n", width(), height());
+        }
 
         timer_ = new QTimer(this);
         connect(timer_, &QTimer::timeout, this, &CantileverWidget::tick);
@@ -166,6 +183,10 @@ public:
 
         elapsed_.start();
         setFocusPolicy(Qt::StrongFocus);
+    }
+
+    ~CantileverWidget() override {
+        stopRecording();
     }
 
 protected:
@@ -315,6 +336,7 @@ protected:
             zoom_ /= 1.2;
             break;
         case Qt::Key_Escape:
+            stopRecording();
             close();
             break;
         }
@@ -353,6 +375,13 @@ private slots:
         if (!paused_) sim_.step();
         frameCount_++;
         update();
+
+        if (recording_ && ffmpeg_ && ffmpeg_->state() == QProcess::Running) {
+            QImage img(size(), QImage::Format_ARGB32);
+            img.fill(Qt::black);
+            render(&img);
+            ffmpeg_->write((const char*)img.constBits(), img.sizeInBytes());
+        }
     }
 
 private:
@@ -361,12 +390,23 @@ private:
     QElapsedTimer elapsed_;
     bool paused_    = false;
     int  frameCount_ = 0;
+    bool recording_  = false;
+    QProcess* ffmpeg_ = nullptr;
     double zoom_      = 1.0;
     double azimuth_   = 0.0;   // orbit around Y (rad)
     double elevation_ = 0.0;   // orbit around X (rad)
     double panX_      = 0.0;   // pan offset (px)
     double panY_      = 0.0;
     QPoint lastMousePos_;
+
+    void stopRecording() {
+        if (ffmpeg_ && ffmpeg_->state() == QProcess::Running) {
+            ffmpeg_->closeWriteChannel();
+            ffmpeg_->waitForFinished(5000);
+            printf("[REC] Saved cantilever_sim.mp4\n");
+            ffmpeg_ = nullptr;
+        }
+    }
 
     void drawColourBar(QPainter& p, int w, int h) {
         int bx = w - 45, by = h/2 - 100, bw = 18, bh = 200;
@@ -455,15 +495,18 @@ private:
 
 // ─────────────────────────────────────────────
 int main(int argc, char* argv[]) {
-    // Parse -c N for thread count
+    // Parse -c N for thread count, -r for recording
+    bool record = false;
     for (int i = 1; i < argc; i++) {
         if (std::string(argv[i]) == "-c" && i+1 < argc) {
             ThreadConfig::setNumThreads(std::atoi(argv[++i]));
+        } else if (std::string(argv[i]) == "-r") {
+            record = true;
         }
     }
 
     QApplication app(argc, argv);
-    CantileverWidget win;
+    CantileverWidget win(record);
     win.show();
     return app.exec();
 }

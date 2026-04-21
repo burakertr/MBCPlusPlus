@@ -6,6 +6,10 @@ A modern C++17 library for **rigid multibody dynamics** and **flexible-body fini
   <img src="output.gif" alt="MBC++ Simulation Example" width="700"/>
 </p>
 
+<p align="center">
+  <img src="output2.gif" alt="MBC++ Cantilever Beam Simulation" width="700"/>
+</p>
+
 ---
 
 ## Features
