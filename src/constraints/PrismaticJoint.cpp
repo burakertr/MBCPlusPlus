@@ -93,4 +93,62 @@ JacobianResult PrismaticJoint::computeJacobian() const {
     return {J1, J2};
 }
 
+std::vector<double> PrismaticJoint::computeVelocityViolation() const {
+    Vec3 p1 = body1_->bodyToWorld(localPoint1_);
+    Vec3 p2 = body2_->bodyToWorld(localPoint2_);
+    Vec3 d = p1.sub(p2);
+    Vec3 axisW = body1_->bodyToWorldDirection(localAxis1_);
+
+    Vec3 ref = (std::abs(axisW.x) < 0.9) ? Vec3::unitX() : Vec3::unitY();
+    Vec3 e = axisW.cross(ref).normalize();
+    Vec3 f = axisW.cross(e).normalize();
+
+    // Velocity of attachment points
+    Mat3 R1 = body1_->orientation.toRotationMatrix();
+    Mat3 R2 = body2_->orientation.toRotationMatrix();
+    Vec3 r1s1 = R1.multiplyVec3(localPoint1_);
+    Vec3 r2s2 = R2.multiplyVec3(localPoint2_);
+    Vec3 vRel = body1_->velocity + body1_->angularVelocity.cross(r1s1)
+              - body2_->velocity - body2_->angularVelocity.cross(r2s2);
+
+    // d/dt(d·e) = vRel·e + d·ėdot, where ėdot = ω1 × e
+    Vec3 edot = body1_->angularVelocity.cross(e);
+    Vec3 fdot = body1_->angularVelocity.cross(f);
+    double cdot1 = vRel.dot(e) + d.dot(edot);
+    double cdot2 = vRel.dot(f) + d.dot(fdot);
+
+    // Orientation: ω1 - ω2
+    Vec3 wRel = body1_->angularVelocity.sub(body2_->angularVelocity);
+
+    return {cdot1, cdot2, wRel.x, wRel.y, wRel.z};
+}
+
+std::vector<double> PrismaticJoint::computeConvectiveTerm() const {
+    Vec3 p1 = body1_->bodyToWorld(localPoint1_);
+    Vec3 p2 = body2_->bodyToWorld(localPoint2_);
+    Vec3 d = p1.sub(p2);
+    Vec3 axisW = body1_->bodyToWorldDirection(localAxis1_);
+    Vec3 ref = (std::abs(axisW.x) < 0.9) ? Vec3::unitX() : Vec3::unitY();
+    Vec3 e = axisW.cross(ref).normalize();
+    Vec3 f = axisW.cross(e).normalize();
+
+    Vec3 w1 = body1_->angularVelocity;
+    Vec3 w2 = body2_->angularVelocity;
+
+    Mat3 R1 = body1_->orientation.toRotationMatrix();
+    Mat3 R2 = body2_->orientation.toRotationMatrix();
+    Vec3 r1s1 = R1.multiplyVec3(localPoint1_);
+    Vec3 r2s2 = R2.multiplyVec3(localPoint2_);
+    Vec3 vRel = body1_->velocity + w1.cross(r1s1)
+              - body2_->velocity - w2.cross(r2s2);
+
+    Vec3 edot = w1.cross(e);
+    Vec3 fdot = w1.cross(f);
+    // Convective = 2*(vRel·ėdot) + d·(w1×edot) [chain rule second derivative]
+    double conv1 = 2.0 * vRel.dot(edot) + d.dot(w1.cross(edot));
+    double conv2 = 2.0 * vRel.dot(fdot) + d.dot(w1.cross(fdot));
+
+    return {conv1, conv2, 0.0, 0.0, 0.0};
+}
+
 } // namespace mb

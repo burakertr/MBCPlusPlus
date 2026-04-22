@@ -85,6 +85,21 @@ public:
     int numConstraintEquations() const;
 
     // ---- Solve / Step ----
+    /// Solve accelerations and multipliers at an arbitrary state st.
+    /// Syncs bodies from st, assembles M/Cq/Q/γ, solves KKT.
+    /// Returns full-state v-space accelerations + Lagrange multipliers.
+    KKTResult solveKKTAtState(double t, StateVector& st);
+
+    /// HHT-DAE mixed KKT: M,Q assembled at α-state; Cq,γ assembled at n+1 state.
+    /// This is the correct Negrut 2007 formulation.
+    KKTResult solveKKTAtHHTState(double t_alpha,
+                                  StateVector& s_alpha,
+                                  StateVector& s_np1);
+
+    /// After post-projection, recompute HHT aPrev_ at the projected state
+    /// and inject it via setAPrev() — preserves Newmark continuity.
+    void recomputeHHTAPrev(double t);
+
     /// Solve for accelerations and multipliers
     SolverResult solveAccelerations(double t);
 

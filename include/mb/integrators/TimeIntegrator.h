@@ -53,6 +53,14 @@ public:
     // Called after external state modification (e.g. constraint projection)
     virtual void invalidateCache() {}
 
+    /**
+     * If false, the integrator handles velocity-level constraints internally
+     * (e.g. HHT-α uses consistent velocity update) and the outer
+     * MultibodySystem::step() should skip the separate velocity projection
+     * to avoid double-counting which bleeds energy.
+     */
+    virtual bool needsVelocityProjection() const { return true; }
+
 protected:
     IntegratorConfig config_;
 };

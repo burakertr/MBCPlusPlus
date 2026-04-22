@@ -62,4 +62,32 @@ JacobianResult FixedJoint::computeJacobian() const {
     return {J1, J2};
 }
 
+std::vector<double> FixedJoint::computeVelocityViolation() const {
+    // Position part: v1 + ω1×(R1*s1) - v2 - ω2×(R2*s2)
+    Mat3 R1 = body1_->orientation.toRotationMatrix();
+    Mat3 R2 = body2_->orientation.toRotationMatrix();
+    Vec3 r1s1 = R1.multiplyVec3(localPoint1_);
+    Vec3 r2s2 = R2.multiplyVec3(localPoint2_);
+    Vec3 vRel = body1_->velocity + body1_->angularVelocity.cross(r1s1)
+              - body2_->velocity - body2_->angularVelocity.cross(r2s2);
+
+    // Orientation part: d/dt(2*qErr.vec) ≈ ω1 - ω2
+    Vec3 wRel = body1_->angularVelocity.sub(body2_->angularVelocity);
+
+    return {vRel.x, vRel.y, vRel.z, wRel.x, wRel.y, wRel.z};
+}
+
+std::vector<double> FixedJoint::computeConvectiveTerm() const {
+    // Position convective: ω×(ω×Rs)
+    Mat3 R1 = body1_->orientation.toRotationMatrix();
+    Mat3 R2 = body2_->orientation.toRotationMatrix();
+    Vec3 r1s1 = R1.multiplyVec3(localPoint1_);
+    Vec3 r2s2 = R2.multiplyVec3(localPoint2_);
+    Vec3 w1 = body1_->angularVelocity;
+    Vec3 w2 = body2_->angularVelocity;
+    Vec3 posConv = w1.cross(w1.cross(r1s1)).sub(w2.cross(w2.cross(r2s2)));
+    // Orientation convective: d/dt(ω1-ω2) = α1-α2 (zero for free rotation — handled by Jacobian)
+    return {posConv.x, posConv.y, posConv.z, 0.0, 0.0, 0.0};
+}
+
 } // namespace mb

@@ -21,6 +21,7 @@ public:
     std::vector<int> getBodyIds() const override;
     ConstraintViolation computeViolation() const override;
     JacobianResult computeJacobian() const override;
+    std::vector<double> computeVelocityViolation() const override;
 
     Vec3 getAxis1World() const;
     Vec3 getAxis2World() const;

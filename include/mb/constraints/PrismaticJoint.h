@@ -19,6 +19,10 @@ public:
     std::vector<int> getBodyIds() const override;
     ConstraintViolation computeViolation() const override;
     JacobianResult computeJacobian() const override;
+    std::vector<double> computeVelocityViolation() const override;
+
+protected:
+    std::vector<double> computeConvectiveTerm() const override;
 
 private:
     RigidBody* body1_;

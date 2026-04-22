@@ -404,25 +404,21 @@ struct Simulation {
         cfg.maxStep=0.0002; cfg.minStep=1e-8;
         sys.setIntegrator(std::make_shared<DormandPrince45>(cfg));
 
-        // ── Motor torku — krank üzerine direk X ekseninde ──────────────────
-        // Piston kuvveti yerine kranktaki eşdeğer tork kullanılıyor.
-        // Bu yaklaşım kısıt drift sorununu tamamen ortadan kaldırır.
-        //
-        // Eşdeğer tork: τ(θ) = F_piston * R * sinθ  (krank-mil moment kolu)
-        // θ = krank açısı, sinθ > 0 → güç zamanı
-        // Tork +X yönünde (sağ el kuralı, krank +X etrafında döner)
-        auto motorTorque = [this](double /*t*/) -> Vec3 {
+        // ── Piston force — applied directly to the piston ─────────────────
+        // The combustion force is applied at the wrist pin location.
+        // The MBS solver automatically converts this to crank torque 
+        // through the connecting rod and joints.
+        auto pistonForce = [this](double /*t*/) -> Vec3 {
             Vec3 pinW = crank->bodyToWorld(Vec3(0, R, 0));
             double theta = std::atan2(pinW.z, pinW.y);
             double sinT  = std::sin(theta);
-            if (sinT <= 0.0) return Vec3(0, 0, 0); // sadece güç zamanı
+            if (sinT <= 0.0) return Vec3(0, 0, 0); // Only during power stroke
             double envelope = 0.5 * (1.0 + std::cos(theta));
             double F_piston = P_PEAK * A_BORE * envelope;
-            double tau      = F_piston * R * sinT; // N·m
-            return Vec3(tau, 0, 0); // +X ekseni etrafında
+            return Vec3(0, -F_piston, 0); // World frame force in -Y direction
         };
-        sys.addForce(std::make_shared<AppliedTorque>(
-            crank.get(), motorTorque, false, "MotorTorque")); // world frame
+        sys.addForce(std::make_shared<AppliedForce>(
+            piston.get(), pistonForce, Vec3(0, PISTON_JOINT_Y, 0), "PistonForce"));
 
         sys.initialize();
         history.clear();

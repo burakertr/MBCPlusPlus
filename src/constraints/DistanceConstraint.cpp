@@ -60,6 +60,20 @@ JacobianResult DistanceConstraint::computeJacobian() const {
     return {J1, J2};
 }
 
+std::vector<double> DistanceConstraint::computeVelocityViolation() const {
+    Vec3 p1 = body1_->bodyToWorld(localPoint1_);
+    Vec3 p2 = body2_->bodyToWorld(localPoint2_);
+    Vec3 d = p1.sub(p2);
+    double dist = d.length();
+    if (dist < 1e-12) return {0.0};
+
+    Vec3 n = d.scale(1.0 / dist);
+    Vec3 v1 = body1_->getPointVelocity(p1);
+    Vec3 v2 = body2_->getPointVelocity(p2);
+    double Cdot = n.dot(v1.sub(v2));
+    return {Cdot};
+}
+
 std::vector<double> DistanceConstraint::computeConvectiveTerm() const {
     Vec3 p1 = body1_->bodyToWorld(localPoint1_);
     Vec3 p2 = body2_->bodyToWorld(localPoint2_);

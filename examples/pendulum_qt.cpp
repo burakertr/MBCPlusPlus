@@ -34,10 +34,16 @@
 #include "mb/integrators/RungeKutta.h"
 #include "mb/system/MultibodySystem.h"
 #include "mb/core/ThreadConfig.h"
+#include "mb/integrators/BDF.h"
+
 #include <cstdlib>
 
 using namespace mb;
-
+static constexpr double DT          = 0.005;   // adım [s]
+static constexpr double T_END       = 30.0;    // simülasyon süresi [s]
+static constexpr double HHT_ALPHA   =  -0.2;    // 0 → Newmark ort. ivme → enerji korunan
+static constexpr double HHT_RELTOL  = 1e-4;   // Newton göreli tolerans
+static constexpr double HHT_ABSTOL  = 1e-6;   // Newton mutlak tolerans
 // ─────────────────────────────────────────────
 //  Simulation wrapper
 // ─────────────────────────────────────────────
@@ -110,12 +116,11 @@ struct Simulation {
 
         // Tight adaptive integrator — important for chaotic double pendulum
         mb::IntegratorConfig cfg;
-        cfg.adaptive = true;
-        cfg.absTol   = 1e-8;
-        cfg.relTol   = 1e-12;
-        cfg.maxStep  = 0.002;
-        cfg.minStep  = 1e-8;
-        sys.setIntegrator(std::make_shared<DormandPrince45>(cfg));
+        cfg.adaptive = false;
+        cfg.relTol   = HHT_RELTOL;
+        cfg.absTol   = HHT_ABSTOL;
+        
+        sys.setIntegrator(std::make_shared<HHTAlpha>(HHT_ALPHA, 10, HHT_ABSTOL, cfg));
 
         sys.initialize();
         updatePositions();

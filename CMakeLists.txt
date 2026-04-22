@@ -85,6 +85,9 @@ target_link_libraries(pendulum_example PRIVATE multibody)
 add_executable(flex_energy_test examples/flex_energy_test.cpp)
 target_link_libraries(flex_energy_test PRIVATE multibody)
 
+add_executable(pendulum_benchmark examples/pendulum_benchmark.cpp)
+target_link_libraries(pendulum_benchmark PRIVATE multibody)
+
 # ---- Qt visualization (optional) ----
 find_package(Qt5 COMPONENTS Widgets QUIET)
 if(Qt5_FOUND)

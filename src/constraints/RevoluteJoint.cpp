@@ -128,6 +128,30 @@ JacobianResult RevoluteJoint::computeJacobian() const {
     return {J1, J2};
 }
 
+std::vector<double> RevoluteJoint::computeVelocityViolation() const {
+    // Position part: same as spherical joint
+    Mat3 R1 = body1_->orientation.toRotationMatrix();
+    Mat3 R2 = body2_->orientation.toRotationMatrix();
+    Vec3 r1s1 = R1.multiplyVec3(localPoint1_);
+    Vec3 r2s2 = R2.multiplyVec3(localPoint2_);
+    Vec3 vRel = body1_->velocity + body1_->angularVelocity.cross(r1s1)
+              - body2_->velocity - body2_->angularVelocity.cross(r2s2);
+
+    // Axis alignment part: d/dt(a1·e) and d/dt(a1·f)
+    Vec3 axis1W = getAxis1World();
+    Vec3 axis2W = getAxis2World();
+    auto [e, f] = getPerpAxes(axis2W);
+
+    Vec3 a1dot = body1_->angularVelocity.cross(axis1W);
+    Vec3 edot  = body2_->angularVelocity.cross(e);
+    Vec3 fdot  = body2_->angularVelocity.cross(f);
+
+    double cdot_e = a1dot.dot(e) + axis1W.dot(edot);
+    double cdot_f = a1dot.dot(f) + axis1W.dot(fdot);
+
+    return {vRel.x, vRel.y, vRel.z, cdot_e, cdot_f};
+}
+
 std::vector<double> RevoluteJoint::computeConvectiveTerm() const {
     // Analytical convective term
     Mat3 R1 = body1_->orientation.toRotationMatrix();

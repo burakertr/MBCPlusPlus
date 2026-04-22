@@ -16,6 +16,16 @@ struct SolverResult {
 };
 
 /**
+ * Result of a coupled KKT solve (used by HHTAlpha coupled DAE mode).
+ * Accelerations are in full-state v-space (size = totalNv).
+ * Lambda are the Lagrange multipliers (size = nc).
+ */
+struct KKTResult {
+    std::vector<double> accel;   ///< Full-state v-space accelerations
+    std::vector<double> lambda;  ///< Constraint multipliers
+};
+
+/**
  * Configuration for constraint solver
  */
 struct SolverConfig {
