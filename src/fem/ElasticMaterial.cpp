@@ -104,9 +104,20 @@ void NeoHookean::secondPiolaStress(const double* F, double* S) const {
 }
 
 void NeoHookean::firstPiolaStress(const double* F, double* P) const {
-    double S[9];
-    secondPiolaStress(F, S);
-    mat3util::mul(F, S, P);
+    // Direct computation of P for Neo-Hookean:
+    // P = μ·F + (λ·ln(J) - μ)·F^{-T}
+    double J = mat3util::det(F);
+    if (std::abs(J) < 1e-20) J = (J >= 0) ? 1e-20 : -1e-20;
+    double lnJ = std::log(std::abs(J));
+
+    // F^{-T} = (F^{-1})^T
+    double Finv[9];
+    mat3util::inv(F, Finv);
+
+    double coeff = lambda_ * lnJ - mu_;
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+            P[i*3+j] = mu_ * F[i*3+j] + coeff * Finv[j*3+i];  // Finv^T_{ij} = Finv_{ji}
 }
 
 // ─── Factory ─────────────────────────────────────────────────

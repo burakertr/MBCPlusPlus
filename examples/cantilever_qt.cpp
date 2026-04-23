@@ -42,10 +42,10 @@ using namespace mb;
 // ─────────────────────────────────────────────
 //  Beam parameters
 // ─────────────────────────────────────────────
-static constexpr double BEAM_Lx   = 1.0;     // length (m)
+static constexpr double BEAM_Lx   = 1;     // length (m)
 static constexpr double BEAM_Ly   = 0.05;    // height (m)
 static constexpr double BEAM_Lz   = 0.05;    // depth  (m)
-static constexpr int    MESH_NX   = 10;
+static constexpr int    MESH_NX   = 50;
 static constexpr int    MESH_NY   = 1;
 static constexpr int    MESH_NZ   = 1;
 
@@ -63,7 +63,7 @@ struct Simulation {
     std::unique_ptr<FlexHHTIntegrator> hht;
     std::unique_ptr<FlexibleBodyIntegrator> rk4Int;
 
-    double dtFrame   = 0.001;     // 1 ms per frame (smaller for stability with full ANCF)
+    double dtFrame   = 0.005;     // 1 ms per frame (smaller for stability with full ANCF)
     double time      = 0;
 
     FlexStepResult lastResult{};
@@ -81,7 +81,7 @@ struct Simulation {
         body = FlexibleBody::fromMesh(mesh, mat, "Cantilever", true);
 
         body->gravity = Vec3(0, -9.81, 0);
-        body->dampingAlpha = 1;   // light damping — settles to static equilibrium
+        body->dampingAlpha = 20;   // light damping — settles to static equilibrium
 
         // Fix the left face (x ≈ 0)
         body->fixNodesOnPlane('x', 0.0, 1e-6);
@@ -89,7 +89,7 @@ struct Simulation {
         hht = std::make_unique<FlexHHTIntegrator>(*body);
         hht->alpha = -0.3;           // strong numerical damping for stability
         hht->newtonTol = 1e-3;
-        hht->maxNewtonIter = 50;
+        hht->maxNewtonIter = 5;
         hht->useAnalyticStiffness = true;   // analytic stiffness with penalty
         hht->verbose = false;
 

@@ -73,6 +73,19 @@ public:
     void computePositionBasedF(const std::vector<ANCFNode>& nodes,
                                double* F) const;
 
+    /// Compute F-bar (volumetric-locking-free deformation gradient).
+    /// Replaces volumetric part of F with averaged Jacobian:
+    ///   F̄ = (J̄/J)^{1/3} · F
+    /// @param Javg  Volume-weighted average Jacobian from surrounding patch
+    void computeFbar(const std::vector<ANCFNode>& nodes,
+                     double Javg, double* Fbar) const;
+
+    /// Pre-computed shape function derivatives in reference coords: dN/dX [4][3]
+    double dNdX_[4][3];
+
+    /// Compute material tangent ∂P/∂F numerically (9×9 Voigt → full tensor)
+    void computeMaterialTangent(const double* F, double* dPdF) const;
+
 private:
     const MaterialModel& material_;
     std::vector<GaussPoint> gaussPoints_;
@@ -81,9 +94,6 @@ private:
     double J0_[9];
     double detJ0_;
 
-    /// Pre-computed shape function derivatives in reference coords: dN/dX [4][3]
-    double dNdX_[4][3];
-
     /// Get Gauss points for tet (1-pt or 4-pt)
     static std::vector<GaussPoint> tetGaussPoints(bool highOrder);
 
@@ -91,9 +101,6 @@ private:
     void shapeMatrix(double xi, double eta, double zeta,
                      const std::vector<ANCFNode>& nodes,
                      double* S) const;
-
-    /// Compute material tangent ∂P/∂F numerically (9×9 Voigt → full tensor)
-    void computeMaterialTangent(const double* F, double* dPdF) const;
 };
 
 } // namespace mb

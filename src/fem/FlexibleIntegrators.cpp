@@ -303,6 +303,7 @@ std::vector<double> FlexHHTIntegrator::solveDenseLU(
 
 FlexStepResult FlexHHTIntegrator::step(double dt) {
     int n = body_.numDof;
+    bool posOnly = body_.positionOnlyMode;
 
     // HHT-α parameters
     double alphaHHT = std::clamp(alpha, -1.0/3.0, 0.0);
@@ -311,7 +312,20 @@ FlexStepResult FlexHHTIntegrator::step(double dt) {
     double h = dt, h2 = h * h;
     double alphaF = 1.0 + alphaHHT;  // force scaling factor (1+α)
 
-    auto freeMap = getFreeDofMap();
+    // Build free DOF map — in positionOnlyMode, only position DOFs (0,1,2) per node
+    std::vector<int> freeMap;
+    if (posOnly) {
+        int nNodes = (int)body_.nodes.size();
+        for (int i = 0; i < nNodes; i++) {
+            int off = i * ANCF_NODE_DOF;
+            for (int d = 0; d < 3; d++) {
+                if (!body_.isDofFixed(off + d))
+                    freeMap.push_back(off + d);
+            }
+        }
+    } else {
+        freeMap = getFreeDofMap();
+    }
     int nf = (int)freeMap.size();
 
     // Save current state
@@ -320,13 +334,10 @@ FlexStepResult FlexHHTIntegrator::step(double dt) {
 
     // Compute forces at current state Q_n (needed for HHT α-blending)
     if (stepCount_ == 0) {
-        body_.setFlexQ(q0);
-        body_.setFlexQd(v0);
+        if (posOnly) body_.syncGradientDOFs();
         Qprev_ = body_.computeTotalForces();
 
-        // Initial acceleration from M·a = Q
-        const auto& M = body_.getGlobalMassMatrix();
-        // Solve M·a = Q for free DOFs using diagonal approximation for initial guess
+        // Initial acceleration from M·a = Q (diagonal approximation)
         auto Mdiag = body_.getMassDiagonalInverse();
         for (int i = 0; i < n; i++)
             aPrev_[i] = body_.isDofFixed(i) ? 0.0 : Mdiag[i] * Qprev_[i];
@@ -340,21 +351,7 @@ FlexStepResult FlexHHTIntegrator::step(double dt) {
     }
 
     // ─── Newton-Raphson iteration on acceleration ────────────
-    // Unknown: a_{n+1}
-    // q_{n+1} = qPred + β·h²·a_{n+1}
-    // v_{n+1} = vPred + γ·h·a_{n+1}
-    //
-    // Residual:
-    //   R = M·a_{n+1} - [(1+α)·Q(q_{n+1}, v_{n+1}) - α·Q_n]
-    //     = M·a_{n+1} - (1+α)·Q_{n+1} + α·Q_n
-    //
-    // Tangent:
-    //   S = M + (1+α)·β·h²·K + (1+α)·γ·h·C
-    //
-    // where K = -∂Q_elastic/∂q (tangent stiffness)
-    //       C = α_damp · M    (Rayleigh mass-proportional damping)
-
-    std::vector<double> a = aPrev_;   // initial guess
+    std::vector<double> a = aPrev_;
     std::vector<double> qCurr(n), vCurr(n);
 
     const auto& M = body_.getGlobalMassMatrix();
@@ -368,6 +365,7 @@ FlexStepResult FlexHHTIntegrator::step(double dt) {
 
         body_.setFlexQ(qCurr);
         body_.setFlexQd(vCurr);
+        if (posOnly) body_.syncGradientDOFs();
         auto Qcurr = body_.computeTotalForces();
 
         // ─── Residual (reduced system, free DOFs only) ───
@@ -414,14 +412,13 @@ FlexStepResult FlexHHTIntegrator::step(double dt) {
 
         // Add stiffness: (1+α)·β·h²·K
         if (useAnalyticStiffness) {
-            // Use analytic stiffness matrix from element assembly
             auto Kglobal = body_.assembleStiffnessMatrix();
             double stiffFactor = alphaF * betaN * h2;
             for (int ii = 0; ii < nf; ii++)
                 for (int jj = 0; jj < nf; jj++)
                     S[ii * nf + jj] += stiffFactor * Kglobal[freeMap[ii] * n + freeMap[jj]];
         } else {
-            // Finite-difference stiffness: K_ij ≈ -(Q(q+ε·ej) - Q(q-ε·ej)) / (2ε)
+            // Finite-difference stiffness
             double stiffFactor = alphaF * betaN * h2;
             for (int jj = 0; jj < nf; jj++) {
                 int j = freeMap[jj];
@@ -431,12 +428,14 @@ FlexStepResult FlexHHTIntegrator::step(double dt) {
                 qPlus[j] += eps_j;
                 body_.setFlexQ(qPlus);
                 body_.setFlexQd(vCurr);
+                if (posOnly) body_.syncGradientDOFs();
                 auto QPlus = body_.computeTotalForces();
 
                 auto qMinus = qCurr;
                 qMinus[j] -= eps_j;
                 body_.setFlexQ(qMinus);
                 body_.setFlexQd(vCurr);
+                if (posOnly) body_.syncGradientDOFs();
                 auto QMinus = body_.computeTotalForces();
 
                 for (int ii = 0; ii < nf; ii++) {
@@ -444,9 +443,9 @@ FlexStepResult FlexHHTIntegrator::step(double dt) {
                     S[ii * nf + jj] -= stiffFactor * dQdq;
                 }
             }
-            // Restore state
             body_.setFlexQ(qCurr);
             body_.setFlexQd(vCurr);
+            if (posOnly) body_.syncGradientDOFs();
         }
 
         // ─── Solve S · Δa = -R ──────────────────────────
@@ -454,13 +453,11 @@ FlexStepResult FlexHHTIntegrator::step(double dt) {
         for (int ii = 0; ii < nf; ii++) negR[ii] = -R[ii];
         auto da = solveDenseLU(S, negR, nf);
 
-        // Check for zero correction (singular tangent)
         double daNorm = 0;
         for (int ii = 0; ii < nf; ii++) daNorm += da[ii] * da[ii];
         daNorm = std::sqrt(daNorm);
-        if (daNorm < 1e-30) break;  // tangent is singular, can't improve
+        if (daNorm < 1e-30) break;
 
-        // ─── Full Newton step (no line search — implicit methods are robust) ──
         for (int ii = 0; ii < nf; ii++)
             a[freeMap[ii]] += da[ii];
     }
@@ -472,6 +469,7 @@ FlexStepResult FlexHHTIntegrator::step(double dt) {
     }
     body_.setFlexQ(qCurr);
     body_.setFlexQd(vCurr);
+    if (posOnly) body_.syncGradientDOFs();
 
     // Store for next step
     Qprev_ = body_.computeTotalForces();
@@ -706,9 +704,23 @@ static std::vector<double> staticSolveLU(std::vector<double>& A, const std::vect
 
 StaticSolveResult solveStaticEquilibrium(FlexibleBody& body, const StaticSolveOptions& opts) {
     int n = body.numDof;
+    bool posOnly = body.positionOnlyMode;
+
+    // Build free DOF map — in positionOnlyMode, only position DOFs (0,1,2) per node
     std::vector<int> freeIdx;
-    for (int i = 0; i < n; i++)
-        if (!body.isDofFixed(i)) freeIdx.push_back(i);
+    if (posOnly) {
+        int nNodes = (int)body.nodes.size();
+        for (int i = 0; i < nNodes; i++) {
+            int off = i * ANCF_NODE_DOF;
+            for (int d = 0; d < 3; d++) {
+                if (!body.isDofFixed(off + d))
+                    freeIdx.push_back(off + d);
+            }
+        }
+    } else {
+        for (int i = 0; i < n; i++)
+            if (!body.isDofFixed(i)) freeIdx.push_back(i);
+    }
     int nf = (int)freeIdx.size();
 
     Vec3 origGravity = body.gravity;

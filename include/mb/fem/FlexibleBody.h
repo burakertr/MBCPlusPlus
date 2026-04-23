@@ -33,6 +33,18 @@ public:
     /// Gradient-DOF penalty: pulls F back toward nearest rotation
     double gradientPenalty = 0.0;
 
+    /// Position-only mode: treat gradient DOFs as slave (derived from position)
+    /// When true, elastic forces and stiffness only act on position DOFs (3 per node).
+    /// Gradient DOFs are automatically updated from position DOFs each step.
+    /// This eliminates the gradient penalty coupling issues and is recommended
+    /// for linear tetrahedral elements where F is constant per element.
+    bool positionOnlyMode = true;
+
+    /// Synchronize gradient DOFs from current position DOFs.
+    /// For each element, computes F = ∂r/∂X from positions, then writes
+    /// the volume-weighted average F to each node's gradient DOFs.
+    void syncGradientDOFs();
+
     /// External force callback
     std::function<std::vector<double>(FlexibleBody&)> externalForces;
 

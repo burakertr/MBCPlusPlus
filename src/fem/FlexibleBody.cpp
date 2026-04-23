@@ -253,28 +253,149 @@ std::vector<double> FlexibleBody::getMassDiagonalInverse() {
 
 // ─── Force Computation ───────────────────────────────────────
 
+void FlexibleBody::syncGradientDOFs() {
+    int nNodes = (int)nodes.size();
+    std::vector<double> Faccum(nNodes * 9, 0.0);
+    std::vector<double> Vaccum(nNodes, 0.0);
+
+    for (const auto& elem : elements) {
+        if (!elem.alive) continue;
+        double Felem[9];
+        elem.computePositionBasedF(nodes, Felem);
+        double vol = elem.V0;
+        for (int k = 0; k < 4; k++) {
+            int nid = elem.nodeIds[k];
+            Vaccum[nid] += vol;
+            for (int d = 0; d < 9; d++)
+                Faccum[nid * 9 + d] += vol * Felem[d];
+        }
+    }
+
+    for (int ni = 0; ni < nNodes; ni++) {
+        if (Vaccum[ni] < 1e-30) continue;
+        double invV = 1.0 / Vaccum[ni];
+        for (int d = 0; d < 9; d++)
+            nodes[ni].q[3 + d] = Faccum[ni * 9 + d] * invV;
+    }
+}
+
 std::vector<double> FlexibleBody::computeElasticForces() {
     int n = numDof;
     std::vector<double> Q(n, 0.0);
     int nElem = (int)elements.size();
 
-    #pragma omp parallel
-    {
-        std::vector<double> Qloc(n, 0.0);
-        #pragma omp for schedule(dynamic) nowait
+    if (positionOnlyMode) {
+        // Position-only: compute elastic forces directly from position DOFs.
+        // Uses nodal-averaged deformation gradient (F-bar approach) to
+        // mitigate volumetric locking in constant-strain linear tetrahedra.
+        //
+        // F-bar method: replace the volumetric part of the element F with
+        // a nodal-averaged J, so that:
+        //   F̄ = (J̄/J)^{1/3} · F
+        // where J̄ is the volume-weighted average of J at the element's nodes.
+        //
+        // For elements with ν close to 0.5 or stiff volumetric response,
+        // this dramatically reduces volumetric locking and allows the
+        // constant-strain tet mesh to represent bending correctly.
+
+        // Step 1: Compute per-element F and J
+        std::vector<double> elemF(nElem * 9);
+        std::vector<double> elemJ(nElem);
         for (int ei = 0; ei < nElem; ei++) {
             if (!elements[ei].alive) continue;
-            const auto& elem = elements[ei];
-            auto Qe = elem.computeElasticForces(nodes);
-            const auto& nids = elem.nodeIds;
+            elements[ei].computePositionBasedF(nodes, &elemF[ei * 9]);
+            double* F = &elemF[ei * 9];
+            elemJ[ei] = F[0]*(F[4]*F[8]-F[5]*F[7])
+                      - F[1]*(F[3]*F[8]-F[5]*F[6])
+                      + F[2]*(F[3]*F[7]-F[4]*F[6]);
+        }
+
+        // Step 2: Compute nodal-averaged J (volume-weighted)
+        int nNodes = (int)nodes.size();
+        std::vector<double> Jsum(nNodes, 0.0);
+        std::vector<double> Vsum(nNodes, 0.0);
+        for (int ei = 0; ei < nElem; ei++) {
+            if (!elements[ei].alive) continue;
+            double vol = elements[ei].V0;
             for (int a = 0; a < 4; a++) {
-                int gOff = nids[a] * ANCF_NODE_DOF;
-                for (int d = 0; d < ANCF_NODE_DOF; d++)
-                    Qloc[gOff+d] += Qe[a*ANCF_NODE_DOF+d];
+                int nid = elements[ei].nodeIds[a];
+                Jsum[nid] += vol * elemJ[ei];
+                Vsum[nid] += vol;
             }
         }
-        #pragma omp critical
-        for (int i = 0; i < n; i++) Q[i] += Qloc[i];
+        std::vector<double> Javg_node(nNodes, 1.0);
+        for (int ni = 0; ni < nNodes; ni++) {
+            if (Vsum[ni] > 1e-30)
+                Javg_node[ni] = Jsum[ni] / Vsum[ni];
+        }
+
+        // Step 3: Compute elastic forces using F-bar
+        #pragma omp parallel
+        {
+            std::vector<double> Qloc(n, 0.0);
+            #pragma omp for schedule(dynamic) nowait
+            for (int ei = 0; ei < nElem; ei++) {
+                if (!elements[ei].alive) continue;
+                const auto& elem = elements[ei];
+                const auto& nids = elem.nodeIds;
+
+                double* F = &elemF[ei * 9];
+                double J = elemJ[ei];
+
+                // Compute element-level averaged J from its nodes
+                double Javg = 0;
+                for (int a = 0; a < 4; a++)
+                    Javg += 0.25 * Javg_node[nids[a]];
+
+                // F-bar scaling: (Javg/J)^{1/3}
+                double Fbar[9];
+                if (std::abs(J) > 1e-30) {
+                    double scale = std::cbrt(Javg / J);
+                    for (int i = 0; i < 9; i++)
+                        Fbar[i] = scale * F[i];
+                } else {
+                    for (int i = 0; i < 9; i++)
+                        Fbar[i] = F[i];
+                }
+
+                double P[9];
+                material->firstPiolaStress(Fbar, P);
+
+                double factor = elem.V0;
+
+                for (int a = 0; a < 4; a++) {
+                    int gOff = nids[a] * ANCF_NODE_DOF;
+                    for (int k = 0; k < 3; k++) {
+                        double val = 0;
+                        for (int j = 0; j < 3; j++)
+                            val += P[k*3+j] * elem.dNdX_[a][j];
+                        Qloc[gOff + k] -= val * factor;
+                    }
+                }
+            }
+            #pragma omp critical
+            for (int i = 0; i < n; i++) Q[i] += Qloc[i];
+        }
+    } else {
+        // Full ANCF mode (original)
+        #pragma omp parallel
+        {
+            std::vector<double> Qloc(n, 0.0);
+            #pragma omp for schedule(dynamic) nowait
+            for (int ei = 0; ei < nElem; ei++) {
+                if (!elements[ei].alive) continue;
+                const auto& elem = elements[ei];
+                auto Qe = elem.computeElasticForces(nodes);
+                const auto& nids = elem.nodeIds;
+                for (int a = 0; a < 4; a++) {
+                    int gOff = nids[a] * ANCF_NODE_DOF;
+                    for (int d = 0; d < ANCF_NODE_DOF; d++)
+                        Qloc[gOff+d] += Qe[a*ANCF_NODE_DOF+d];
+                }
+            }
+            #pragma omp critical
+            for (int i = 0; i < n; i++) Q[i] += Qloc[i];
+        }
     }
 
     for (int d = 0; d < n; d++)
@@ -286,15 +407,25 @@ std::vector<double> FlexibleBody::computeElasticForces() {
 std::vector<double> FlexibleBody::computeGravityForces() {
     int n = numDof;
     std::vector<double> Q(n, 0.0);
-    const auto& Mdiag = getMassDiagonal();
     double gVec[3] = {gravity.x, gravity.y, gravity.z};
 
-    for (int i = 0; i < (int)nodes.size(); i++) {
-        int off = i * ANCF_NODE_DOF;
-        // Only position DOFs get gravity
-        for (int d = 0; d < 3; d++) {
-            if (!fixedDofMask_[off+d])
-                Q[off+d] = Mdiag[off+d] * gVec[d];
+    // Compute consistent nodal gravity forces using element-level lumped mass.
+    // Each node accumulates ρ * V0 / 4 from each attached element.
+    // Total gravity = Σ_elem ρ * V0 * g = ρ * V_total * g  ✓
+    //
+    // For fixed nodes, the force is zeroed, but the total force on free nodes
+    // should still be correct (fixed nodes "eat" some force as reactions).
+    double rho = material->density();
+
+    for (const auto& elem : elements) {
+        if (!elem.alive) continue;
+        double nodalForce = rho * elem.V0 / 4.0;
+        for (int a = 0; a < 4; a++) {
+            int gOff = elem.nodeIds[a] * ANCF_NODE_DOF;
+            for (int d = 0; d < 3; d++) {
+                if (!fixedDofMask_[gOff + d])
+                    Q[gOff + d] += nodalForce * gVec[d];
+            }
         }
     }
 
@@ -350,23 +481,12 @@ std::vector<double> FlexibleBody::computeTotalForces() {
     }
 
     // ── ANCF Gradient Consistency ─────────────────────────────
-    // Pull gradient DOFs toward the position-derived F.
-    // For each node, compute a volume-weighted average of the
-    // element-level deformation gradients (from position DOFs),
-    // then apply a penalty force:
-    //   Q_grad[d] -= κ · (F_grad[d] - F_pos[d])
-    // where κ = gradientPenalty (should be large, e.g. E * V0_avg).
-    //
-    // The default penalty auto-scales from material stiffness.
-    {
-        // Compute penalty stiffness if auto (gradientPenalty <= 0 uses auto)
+    // In position-only mode, gradient DOFs are slaves — no penalty needed.
+    // In full ANCF mode, apply penalty to couple gradient DOFs to positions.
+    if (!positionOnlyMode) {
         double kappa = gradientPenalty;
-        if (kappa <= 0) {
-            // Auto-scale: κ = E (Young's modulus) — strong enough to enforce consistency
-            kappa = materialProps.E;
-        }
+        if (kappa <= 0) kappa = materialProps.E;
 
-        // Accumulate volume-weighted F from elements for each node
         int nNodes = (int)nodes.size();
         std::vector<double> Faccum(nNodes * 9, 0.0);
         std::vector<double> Vaccum(nNodes, 0.0);
@@ -384,7 +504,6 @@ std::vector<double> FlexibleBody::computeTotalForces() {
             }
         }
 
-        // Apply penalty
         #pragma omp parallel for schedule(static)
         for (int ni = 0; ni < nNodes; ni++) {
             if (Vaccum[ni] < 1e-30) continue;
@@ -415,34 +534,75 @@ std::vector<double> FlexibleBody::assembleStiffnessMatrix() {
     std::vector<double> K(n * n, 0.0);
     int nElem = (int)elements.size();
 
-    #pragma omp parallel
-    {
-        std::vector<double> Kloc(n * n, 0.0);
-        #pragma omp for schedule(dynamic) nowait
-        for (int ei = 0; ei < nElem; ei++) {
-            if (!elements[ei].alive) continue;
-            const auto& elem = elements[ei];
-            auto Ke = elem.computeStiffnessMatrix(nodes);
-            const auto& nids = elem.nodeIds;
+    if (positionOnlyMode) {
+        // Position-only mode: assemble only pos-pos block directly
+        // K(a_k, b_m) = Σ_jl dNa/dXj · dPdF(kj,ml) · dNb/dXl · V0
+        // This is -dQe/dq (positive definite)
+        #pragma omp parallel
+        {
+            std::vector<double> Kloc(n * n, 0.0);
+            #pragma omp for schedule(dynamic) nowait
+            for (int ei = 0; ei < nElem; ei++) {
+                if (!elements[ei].alive) continue;
+                const auto& elem = elements[ei];
+                const auto& nids = elem.nodeIds;
 
-            for (int a = 0; a < 4; a++)
-                for (int b = 0; b < 4; b++) {
-                    int gA = nids[a] * ANCF_NODE_DOF;
-                    int gB = nids[b] * ANCF_NODE_DOF;
-                    for (int i = 0; i < ANCF_NODE_DOF; i++)
-                        for (int j = 0; j < ANCF_NODE_DOF; j++) {
-                            int eRow = a * ANCF_NODE_DOF + i;
-                            int eCol = b * ANCF_NODE_DOF + j;
-                            Kloc[(gA+i)*n + (gB+j)] += Ke[eRow*48+eCol];
+                double F[9];
+                elem.computePositionBasedF(nodes, F);
+
+                double dPdF[81];
+                elem.computeMaterialTangent(F, dPdF);
+
+                double factor = elem.V0;
+
+                for (int a = 0; a < 4; a++) {
+                    for (int b = 0; b < 4; b++) {
+                        int gA = nids[a] * ANCF_NODE_DOF;
+                        int gB = nids[b] * ANCF_NODE_DOF;
+                        for (int m1 = 0; m1 < 3; m1++) {
+                            for (int m2 = 0; m2 < 3; m2++) {
+                                double val = 0;
+                                for (int j = 0; j < 3; j++)
+                                    for (int l = 0; l < 3; l++)
+                                        val += elem.dNdX_[a][j] * dPdF[(m1*3+j)*9 + (m2*3+l)] * elem.dNdX_[b][l];
+                                Kloc[(gA+m1)*n + (gB+m2)] += val * factor;
+                            }
                         }
+                    }
                 }
+            }
+            #pragma omp critical
+            for (int i = 0; i < n * n; i++) K[i] += Kloc[i];
         }
-        #pragma omp critical
-        for (int i = 0; i < n * n; i++) K[i] += Kloc[i];
-    }
+    } else {
+        // Full ANCF mode (original)
+        #pragma omp parallel
+        {
+            std::vector<double> Kloc(n * n, 0.0);
+            #pragma omp for schedule(dynamic) nowait
+            for (int ei = 0; ei < nElem; ei++) {
+                if (!elements[ei].alive) continue;
+                const auto& elem = elements[ei];
+                auto Ke = elem.computeStiffnessMatrix(nodes);
+                const auto& nids = elem.nodeIds;
 
-    // Add gradient consistency penalty stiffness: κ·I on gradient DOFs
-    {
+                for (int a = 0; a < 4; a++)
+                    for (int b = 0; b < 4; b++) {
+                        int gA = nids[a] * ANCF_NODE_DOF;
+                        int gB = nids[b] * ANCF_NODE_DOF;
+                        for (int i = 0; i < ANCF_NODE_DOF; i++)
+                            for (int j = 0; j < ANCF_NODE_DOF; j++) {
+                                int eRow = a * ANCF_NODE_DOF + i;
+                                int eCol = b * ANCF_NODE_DOF + j;
+                                Kloc[(gA+i)*n + (gB+j)] += Ke[eRow*48+eCol];
+                            }
+                    }
+            }
+            #pragma omp critical
+            for (int i = 0; i < n * n; i++) K[i] += Kloc[i];
+        }
+
+        // Add gradient consistency penalty stiffness: κ·I on gradient DOFs
         double kappa = gradientPenalty;
         if (kappa <= 0) kappa = materialProps.E;
 

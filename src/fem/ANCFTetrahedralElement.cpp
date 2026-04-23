@@ -187,28 +187,13 @@ void ANCFTetrahedralElement::computeDeformationGradient(
     const std::vector<ANCFNode>& nodes,
     double* F) const
 {
-    // ANCF continuum mechanics deformation gradient:
-    //
-    //   F_ij = ∂r_i/∂X_j = Σ_a (∂Na/∂Xj) · r_a_i
-    //
-    // where r_a_i = q_a[i] (position DOFs at node a).
-    //
-    // For a linear tet with constant shape function derivatives,
-    // F is constant over the element and independent of (ξ,η,ζ).
-    //
-    // This is the PRIMARY F used for constitutive evaluation.
-    // The gradient DOFs store F at each node as secondary variables
-    // that are driven by a consistency penalty to match this F.
-
+    // F_ij = Σ_a (∂Na/∂Xj) · q_a_i  (position DOFs, constant over element)
     std::fill(F, F + 9, 0.0);
-
     for (int a = 0; a < 4; a++) {
         const auto& nd = nodes[nodeIds[a]];
-        for (int i = 0; i < 3; i++) {
-            for (int j = 0; j < 3; j++) {
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++)
                 F[i*3+j] += dNdX_[a][j] * nd.q[i];
-            }
-        }
     }
 }
 
@@ -217,6 +202,27 @@ void ANCFTetrahedralElement::computePositionBasedF(
     double* F) const
 {
     computeDeformationGradient(0, 0, 0, nodes, F);
+}
+
+void ANCFTetrahedralElement::computeFbar(
+    const std::vector<ANCFNode>& nodes,
+    double Javg, double* Fbar) const
+{
+    // Standard F from position DOFs
+    double F[9];
+    computePositionBasedF(nodes, F);
+
+    // J = det(F)
+    double J = F[0]*(F[4]*F[8]-F[5]*F[7])
+             - F[1]*(F[3]*F[8]-F[5]*F[6])
+             + F[2]*(F[3]*F[7]-F[4]*F[6]);
+
+    if (std::abs(J) < 1e-30) J = 1e-30;
+
+    // F-bar = (Javg/J)^{1/3} * F
+    double scale = std::cbrt(Javg / J);
+    for (int i = 0; i < 9; i++)
+        Fbar[i] = scale * F[i];
 }
 
 // ─── Material Tangent ────────────────────────────────────────
@@ -253,61 +259,25 @@ void ANCFTetrahedralElement::computeMaterialTangent(
 std::vector<double> ANCFTetrahedralElement::computeElasticForces(
     const std::vector<ANCFNode>& nodes) const
 {
-    // Full ANCF elastic forces acting on all 48 DOFs.
-    //
-    // The deformation gradient is computed from POSITION DOFs:
-    //   F_ij = Σ_a dNa/dXj · q_a_i
-    //
-    // (A) Position DOF forces (standard FEM):
-    //   Qe_a_k = -Σ_j P_kj · dNa/dXj · V0_gp
-    //
-    // (B) Gradient DOF forces (ANCF consistency):
-    //   The gradient DOFs q_a[3+j*3+i] = Fa_ij store the deformation
-    //   gradient at node a.  We apply forces to keep them consistent
-    //   with the position-derived F via:
-    //
-    //   Qe_a_grad[j,i] = -Na · P_ij · V0_gp
-    //
-    //   This is the variational derivative of the strain energy
-    //   w.r.t. the gradient DOFs, treating them as contributing
-    //   to F through the ANCF interpolation.
-
     std::vector<double> Qe(ANCF_ELEM_DOF, 0.0);
 
     for (const auto& gp : gaussPoints_) {
-        // Compute F from position DOFs (the reliable source)
         double F[9];
         computeDeformationGradient(gp.xi, gp.eta, gp.zeta, nodes, F);
 
-        // Compute first Piola-Kirchhoff stress
         double P[9];
         material_.firstPiolaStress(F, P);
 
         double factor = std::abs(detJ0_) * gp.weight;
 
-        // Shape function values at this Gauss point
-        double N[4] = {1.0 - gp.xi - gp.eta - gp.zeta, gp.xi, gp.eta, gp.zeta};
-
         for (int a = 0; a < 4; a++) {
             int off = a * ANCF_NODE_DOF;
-
-            // (A) Position DOF forces:
-            //   Qe_a_k = -Σ_j P_kj · dNa/dXj · |J0| · w
+            // Position DOF forces: Qe_a_k = -Σ_j P_kj · dNa/dXj · |J0| · w
             for (int k = 0; k < 3; k++) {
                 double val = 0;
-                for (int j = 0; j < 3; j++) {
+                for (int j = 0; j < 3; j++)
                     val += P[k*3+j] * dNdX_[a][j];
-                }
                 Qe[off + k] -= val * factor;
-            }
-
-            // (B) Gradient DOF forces:
-            //   Qe_a[3+j*3+i] = -Na · P_ij · |J0| · w
-            for (int j = 0; j < 3; j++) {
-                for (int i = 0; i < 3; i++) {
-                    int gradDof = 3 + j*3 + i;
-                    Qe[off + gradDof] -= N[a] * P[i*3+j] * factor;
-                }
             }
         }
     }
@@ -320,24 +290,6 @@ std::vector<double> ANCFTetrahedralElement::computeElasticForces(
 std::vector<double> ANCFTetrahedralElement::computeStiffnessMatrix(
     const std::vector<ANCFNode>& nodes) const
 {
-    // Full ANCF tangent stiffness matrix (48×48).
-    //
-    // Since F is computed from position DOFs, the primary stiffness
-    // is in the position-position block (Kpp).  The gradient DOF
-    // forces also depend on F (through P), so there are cross-blocks.
-    //
-    // DOF types and their ∂F/∂q:
-    //
-    // Position DOF q_a_m (local index m, m<3):
-    //   ∂F_ij/∂(q_a_m) = δ_im · dNa/dXj
-    //
-    // Gradient DOFs don't directly enter F (F is from positions),
-    // but the gradient DOF forces depend on P(F), which depends on
-    // position DOFs.  Thus:
-    //   Kpg = 0  (gradient DOFs don't affect F)
-    //   Kgp ≠ 0  (position DOFs affect P, which affects gradient forces)
-    //   Kgg = 0  (gradient DOFs don't affect F)
-
     int n = ANCF_ELEM_DOF;  // 48
     std::vector<double> Ke(n * n, 0.0);
 
@@ -345,57 +297,26 @@ std::vector<double> ANCFTetrahedralElement::computeStiffnessMatrix(
         double F[9];
         computeDeformationGradient(gp.xi, gp.eta, gp.zeta, nodes, F);
 
-        // ∂P_ij/∂F_kl  stored as dPdF[(i*3+j)*9 + (k*3+l)]
         double dPdF[81];
         computeMaterialTangent(F, dPdF);
 
         double factor = std::abs(detJ0_) * gp.weight;
-
-        double N[4] = {1.0 - gp.xi - gp.eta - gp.zeta, gp.xi, gp.eta, gp.zeta};
 
         for (int a = 0; a < 4; a++) {
             for (int b = 0; b < 4; b++) {
                 int offA = a * ANCF_NODE_DOF;
                 int offB = b * ANCF_NODE_DOF;
 
-                // ─── (1) Position-Position block: Kpp ─────
-                // Ke[offA+m1, offB+m2] = Σ_j Σ_l dNa/dXj · (∂P_{m1,j}/∂F_{m2,l}) · dNb/dXl
+                // Position-Position block: Kpp
                 for (int m1 = 0; m1 < 3; m1++) {
                     for (int m2 = 0; m2 < 3; m2++) {
                         double val = 0;
-                        for (int j = 0; j < 3; j++) {
-                            for (int l = 0; l < 3; l++) {
+                        for (int j = 0; j < 3; j++)
+                            for (int l = 0; l < 3; l++)
                                 val += dNdX_[a][j] * dPdF[(m1*3+j)*9 + (m2*3+l)] * dNdX_[b][l];
-                            }
-                        }
                         Ke[(offA+m1)*n + (offB+m2)] += val * factor;
                     }
                 }
-
-                // ─── (2) Gradient-Position block: Kgp ─────
-                // The gradient DOF force at node a depends on P, which depends on
-                // position DOFs at node b.
-                // ∂(Qgrad_a[l1,m1])/∂(qpos_b_m2)
-                //   = -Na · Σ_j (∂P_{m1,l1}/∂F_{m2,j}) · dNb/dXj · factor
-                for (int l1 = 0; l1 < 3; l1++) {
-                    for (int m1 = 0; m1 < 3; m1++) {
-                        int gradDofA = 3 + l1*3 + m1;
-                        for (int m2 = 0; m2 < 3; m2++) {
-                            double val = 0;
-                            for (int j = 0; j < 3; j++) {
-                                val += dPdF[(m1*3+l1)*9 + (m2*3+j)] * dNdX_[b][j];
-                            }
-                            val *= N[a] * factor;
-                            Ke[(offA+gradDofA)*n + (offB+m2)] += val;
-                        }
-                    }
-                }
-
-                // ─── (3) Position-Gradient block: Kpg = 0 ─────
-                // Gradient DOFs don't affect F, so ∂Qpos/∂qgrad = 0
-
-                // ─── (4) Gradient-Gradient block: Kgg = 0 ─────
-                // Gradient DOFs don't affect F, so ∂Qgrad/∂qgrad = 0
             }
         }
     }

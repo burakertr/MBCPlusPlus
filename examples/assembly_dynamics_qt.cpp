@@ -70,6 +70,7 @@
 #include "mb/forces/AppliedForce.h"
 #include "mb/solvers/DirectSolver.h"
 #include "mb/integrators/RungeKutta.h"
+#include "mb/integrators/BDF.h"
 #include "mb/system/MultibodySystem.h"
 #include "mb/core/ThreadConfig.h"
 
@@ -399,10 +400,12 @@ struct Simulation {
             Vec3(1,0,0), Vec3(1,0,0), 0.0, "J_Driven"));
 
         sys.setSolver(std::make_shared<DirectSolver>());
+        // HHT-α: α=-0.05 → hafif yüksek-frekans sönümlemesi, 2. derece doğru
+        // γ=0.55, β=0.2756 (otomatik hesaplanır), koşulsuz kararlı
         IntegratorConfig cfg;
-        cfg.adaptive=true; cfg.absTol=1e-7; cfg.relTol=1e-6;
-        cfg.maxStep=0.0002; cfg.minStep=1e-8;
-        sys.setIntegrator(std::make_shared<DormandPrince45>(cfg));
+        cfg.adaptive=false; cfg.maxStep=dt; cfg.minStep=1e-8;
+        auto hht = std::make_shared<HHTAlpha>(-0.05, 6, 1e-6, cfg);
+        sys.setIntegrator(hht);
 
         // ── Piston force — applied directly to the piston ─────────────────
         // The combustion force is applied at the wrist pin location.
