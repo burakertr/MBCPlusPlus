@@ -88,6 +88,9 @@ target_link_libraries(flex_energy_test PRIVATE multibody)
 add_executable(pendulum_benchmark examples/pendulum_benchmark.cpp)
 target_link_libraries(pendulum_benchmark PRIVATE multibody)
 
+add_executable(cantilever_static_test examples/cantilever_static_test.cpp)
+target_link_libraries(cantilever_static_test PRIVATE multibody)
+
 # ---- Qt visualization (optional) ----
 find_package(Qt5 COMPONENTS Widgets QUIET)
 if(Qt5_FOUND)
@@ -115,6 +118,8 @@ if(Qt5_FOUND)
 
     add_executable(bending_fracture_qt examples/bending_fracture_qt.cpp)
     target_link_libraries(bending_fracture_qt PRIVATE multibody Qt5::Widgets)
+
+
 
     # OpenCASCADE (STEP okuma + tessellation)
     set(OCCT_INC /usr/include/opencascade)
