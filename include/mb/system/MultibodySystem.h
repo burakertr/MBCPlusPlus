@@ -44,7 +44,7 @@ struct SimStats {
 /**
  * Central manager of a multibody system.
  * Assembles M, Cq, Q, γ; creates derivative functions;
- * integrates with constraint projection (GGL stabilization).
+ * integrates constrained dynamics in coupled DAE form.
  */
 class MultibodySystem {
 public:
@@ -96,6 +96,16 @@ public:
                                   StateVector& s_alpha,
                                   StateVector& s_np1);
 
+    /// Evaluate nonlinear HHT-DAE residual components for Newton iterations.
+    void evaluateHHTDAEResidual(double t_alpha,
+                                StateVector& s_alpha,
+                                StateVector& s_np1,
+                                const std::vector<double>& aFull,
+                                const std::vector<double>& lambda,
+                                std::vector<double>& dynResidual,
+                                std::vector<double>& C,
+                                std::vector<double>& Cdot);
+
     /// After post-projection, recompute HHT aPrev_ at the projected state
     /// and inject it via setAPrev() — preserves Newmark continuity.
     void recomputeHHTAPrev(double t);
@@ -113,7 +123,7 @@ public:
     SimStats simulate(double tf, double dt,
         std::function<void(double, const StateVector&)> callback = nullptr);
 
-    // ---- Constraint projection (GGL) ----
+    // ---- Legacy projection helpers (not used by coupled HHT-DAE path) ----
     void projectConstraintsPosition();
     void projectConstraintsVelocity();
 

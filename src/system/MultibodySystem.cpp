@@ -1,5 +1,5 @@
 #include "mb/system/MultibodySystem.h"
-#include "mb/solvers/DirectSolver.h"
+#include "mb/solvers/NewtonRaphson.h"
 #include "mb/integrators/RungeKutta.h"
 #include "mb/integrators/BDF.h"
 #include <omp.h>
@@ -9,6 +9,26 @@
 #include <numeric>
 
 namespace mb {
+
+namespace {
+void computeConstraintMetrics(
+    const std::vector<std::shared_ptr<Constraint>>& constraints,
+    double& maxPos,
+    double& maxVel)
+{
+    maxPos = 0.0;
+    maxVel = 0.0;
+    for (const auto& c : constraints) {
+        auto viol = c->computeViolation();
+        for (double v : viol.position)
+            maxPos = std::max(maxPos, std::abs(v));
+
+        auto cdot = c->computeVelocityViolation();
+        for (double v : cdot)
+            maxVel = std::max(maxVel, std::abs(v));
+    }
+}
+} // namespace
 
 MultibodySystem::MultibodySystem(const std::string& name)
     : name_(name) {}
@@ -60,7 +80,7 @@ void MultibodySystem::initialize() {
 
     // Default solver/integrator if not set
     if (!solver_)
-        solver_ = std::make_shared<DirectSolver>();
+        solver_ = std::make_shared<NewtonRaphsonSolver>();
     if (!integrator_)
         integrator_ = std::make_shared<RungeKutta4>();
 
@@ -231,6 +251,10 @@ KKTResult MultibodySystem::solveKKTAtState(double t, StateVector& st) {
     for (int i = 0; i < nc && (totalDynNv_ + i) < (int)solverResult.x.size(); i++)
         result.lambda[i] = solverResult.x[totalDynNv_ + i];
 
+    computeConstraintMetrics(constraints_,
+                             result.maxPositionViolation,
+                             result.maxVelocityViolation);
+
     return result;
 }
 
@@ -305,7 +329,76 @@ KKTResult MultibodySystem::solveKKTAtHHTState(
     for (int i = 0; i < nc && (totalDynNv_ + i) < (int)solverResult.x.size(); i++)
         result.lambda[i] = solverResult.x[totalDynNv_ + i];
 
+    // Metrics at n+1 state (where constraint consistency matters)
+    computeConstraintMetrics(constraints_,
+                             result.maxPositionViolation,
+                             result.maxVelocityViolation);
+
     return result;
+}
+
+void MultibodySystem::evaluateHHTDAEResidual(
+    double t_alpha,
+    StateVector& s_alpha,
+    StateVector& s_np1,
+    const std::vector<double>& aFull,
+    const std::vector<double>& lambda,
+    std::vector<double>& dynResidual,
+    std::vector<double>& C,
+    std::vector<double>& Cdot)
+{
+    auto ptrs = bodyPtrs();
+
+    // 1) Dynamic residual at alpha-state:
+    //    r_dyn = M(q_alpha) * a_dyn + Cq(q_alpha)^T * lambda - Q(t_alpha, q_alpha, v_alpha)
+    for (int b = 0; b < (int)ptrs.size(); b++)
+        s_alpha.copyToBody(b, ptrs[b]);
+
+    MatrixN M = assembleMassMatrix();
+    MatrixN Cq = assembleJacobian();
+    std::vector<double> Q = assembleForces(t_alpha);
+
+    std::vector<double> aDyn(totalDynNv_, 0.0);
+    for (int di = 0; di < (int)dynBodyIndices_.size(); di++) {
+        int bodyIdx = dynBodyIndices_[di];
+        int dynOff  = dynVOffsets_[di];
+        int fullOff = s_alpha.vOffsets[bodyIdx];
+        int nvb     = s_alpha.nvPerBody[bodyIdx];
+        for (int j = 0; j < nvb; j++) {
+            if ((fullOff + j) < (int)aFull.size())
+                aDyn[dynOff + j] = aFull[fullOff + j];
+        }
+    }
+
+    int nc = numConstraintEquations();
+    std::vector<double> lam(nc, 0.0);
+    for (int i = 0; i < nc && i < (int)lambda.size(); i++)
+        lam[i] = lambda[i];
+
+    std::vector<double> Ma = M.multiplyVector(aDyn);
+    std::vector<double> CqTL = Cq.transpose().multiplyVector(lam);
+
+    dynResidual.assign(totalDynNv_, 0.0);
+    for (int i = 0; i < totalDynNv_; i++) {
+        double qv = (i < (int)Q.size()) ? Q[i] : 0.0;
+        double cqt = (i < (int)CqTL.size()) ? CqTL[i] : 0.0;
+        dynResidual[i] = Ma[i] + cqt - qv;
+    }
+
+    // 2) Constraint residuals at n+1 state
+    for (int b = 0; b < (int)ptrs.size(); b++)
+        s_np1.copyToBody(b, ptrs[b]);
+
+    C.clear();
+    Cdot.clear();
+    C.reserve(numConstraintEquations());
+    Cdot.reserve(numConstraintEquations());
+    for (const auto& c : constraints_) {
+        auto viol = c->computeViolation();
+        auto vel = c->computeVelocityViolation();
+        C.insert(C.end(), viol.position.begin(), viol.position.end());
+        Cdot.insert(Cdot.end(), vel.begin(), vel.end());
+    }
 }
 
 DerivativeFunction MultibodySystem::createDerivativeFunction() {
@@ -389,6 +482,18 @@ StepResult MultibodySystem::step(double dt) {
                                  StateVector& s_np1) -> KKTResult {
             return solveKKTAtHHTState(t_alpha, s_alpha, s_np1);
         });
+        hht->setDAEResidualEvaluator(
+            [this](double t_alpha,
+                   StateVector& s_alpha,
+                   StateVector& s_np1,
+                   const std::vector<double>& a_full,
+                   const std::vector<double>& lambda,
+                   std::vector<double>& dynResidual,
+                   std::vector<double>& C,
+                   std::vector<double>& Cdot) {
+                evaluateHHTDAEResidual(t_alpha, s_alpha, s_np1,
+                                       a_full, lambda, dynResidual, C, Cdot);
+            });
     }
 
     // Adaptive sub-stepping loop — matches TS step() exactly.

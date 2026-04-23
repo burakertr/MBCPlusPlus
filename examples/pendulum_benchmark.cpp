@@ -27,7 +27,7 @@
 
 #include "mb/core/RigidBody.h"
 #include "mb/constraints/SphericalJoint.h"
-#include "mb/solvers/DirectSolver.h"
+#include "mb/solvers/NewtonRaphson.h"
 #include "mb/integrators/RungeKutta.h"
 #include "mb/integrators/BDF.h"
 #include "mb/system/MultibodySystem.h"
@@ -46,7 +46,8 @@ static constexpr double g   = 9.81;
 // ── Benchmark parametreleri ───────────────────────────────────────────────────
 static constexpr double DT          = 0.005;   // adım [s]
 static constexpr double T_END       = 30.0;
-static constexpr double HHT_ALPHA   = -0.2;   // HHT sönümleme: [-1/3, 0]
+static constexpr double HHT_ALPHA   = -0.04;  // HHT sönümleme: [-1/3, 0]
+static constexpr double HHT_DT      = 0.005; // enerji/constraint dengesi için varsayılan
 static constexpr double HHT_RELTOL  = 1e-4;   // Newton göreli tolerans
 static constexpr double HHT_ABSTOL  = 1e-6;   // Newton mutlak tolerans
 
@@ -93,18 +94,24 @@ struct Simulation {
             Vec3(0, L1 * 0.5, 0), Vec3(0, -L2 * 0.5, 0), "J2");
         sys.addConstraint(joint2);
 
-        sys.setSolver(std::make_shared<DirectSolver>());
+        SolverConfig solverCfg;
+        solverCfg.maxIterations = 25;
+        solverCfg.tolerance = 1e-10;
+        solverCfg.warmStart = true;
+        sys.setSolver(std::make_shared<NewtonRaphsonSolver>(solverCfg));
 
         // integrator seçimi dışarıdan yapılır
         sys.initialize();
     }
 
-    void useHHT() {
+    void useHHT(double alpha, double dt) {
         mb::IntegratorConfig cfg;
         cfg.adaptive = false;
         cfg.relTol   = HHT_RELTOL;
         cfg.absTol   = HHT_ABSTOL;
-        sys.setIntegrator(std::make_shared<HHTAlpha>(HHT_ALPHA, 50, HHT_ABSTOL, cfg));
+        cfg.maxStep  = dt;
+        cfg.minStep  = std::max(1e-8, dt * 1e-3);
+        sys.setIntegrator(std::make_shared<HHTAlpha>(alpha, 50, HHT_ABSTOL, cfg));
     }
 
     void useDOPRI(double relTol = 1e-8, double absTol = 1e-10) {
@@ -131,6 +138,9 @@ int main(int argc, char* argv[]) {
 
     bool useDopri = false;
     double dopriRel = 1e-8, dopriAbs = 1e-10;
+    double hhtAlpha = HHT_ALPHA;
+    double dtStep = HHT_DT;
+    double simDuration = T_END;
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -138,21 +148,27 @@ int main(int argc, char* argv[]) {
             ThreadConfig::setNumThreads(std::atoi(argv[++i]));
         else if (a == "--dopri") useDopri = true;
         else if (a == "--hht")   useDopri = false;
+        else if (a == "--alpha" && i + 1 < argc) hhtAlpha = std::atof(argv[++i]);
+        else if (a == "--dt" && i + 1 < argc)    dtStep = std::atof(argv[++i]);
+        else if (a == "--tend" && i + 1 < argc)  simDuration = std::atof(argv[++i]);
     }
 
-    constexpr double SIM_DURATION = T_END;
+    if (hhtAlpha < -1.0/3.0) hhtAlpha = -1.0/3.0;
+    if (hhtAlpha > 0.0) hhtAlpha = 0.0;
+    if (dtStep <= 0.0) dtStep = HHT_DT;
+    if (simDuration <= 0.0) simDuration = T_END;
 
     printSeparator('=');
     printf("  MBC++ — Double Pendulum Benchmark\n");
     printf("  Sistem : L1=%.1f m  L2=%.1f m  m1=%.1f kg  m2=%.1f kg  g=%.2f m/s²\n",
            L1, L2, m1, m2, g);
-    printf("  T_end  : %.1f s\n", T_END);
+    printf("  T_end  : %.1f s\n", simDuration);
     if (useDopri) {
         printf("  Integratör : DormandPrince45 (adaptif)\n");
         printf("  relTol=%.1e  absTol=%.1e\n", dopriRel, dopriAbs);
     } else {
         printf("  Integratör : HHT-α (implicit, sabit adım)\n");
-        printf("  dt=%.4f s  alpha=%.4f  absTol=%.1e\n", DT, HHT_ALPHA, HHT_ABSTOL);
+        printf("  dt=%.4f s  alpha=%.4f  absTol=%.1e\n", dtStep, hhtAlpha, HHT_ABSTOL);
     }
     printSeparator('=');
     fflush(stdout);
@@ -161,7 +177,7 @@ int main(int argc, char* argv[]) {
     Simulation sim;
     sim.build(3.0);
     if (useDopri) sim.useDOPRI(dopriRel, dopriAbs);
-    else          sim.useHHT();
+    else          sim.useHHT(hhtAlpha, dtStep);
 
     auto analyzeInitial = sim.sys.analyze();
     double E0 = analyzeInitial.totalEnergy;
@@ -181,8 +197,9 @@ int main(int argc, char* argv[]) {
     using Clock = std::chrono::high_resolution_clock;
     auto wallStart = Clock::now();
 
-    while (sim.sys.getTime() < SIM_DURATION) {
-        sim.step();
+    while (sim.sys.getTime() < simDuration) {
+        if (useDopri) sim.step();
+        else sim.sys.step(dtStep);
         totalSteps++;
 
         auto a = sim.sys.analyze();
@@ -194,7 +211,7 @@ int main(int argc, char* argv[]) {
         if (ee > maxEnergyError)         maxEnergyError = ee;
 
         // İlerleme çubuğu (wall-clock'a göre değil, simülasyon zamanına göre)
-        double progress = sim.sys.getTime() / SIM_DURATION;
+        double progress = sim.sys.getTime() / simDuration;
         int barFilled   = static_cast<int>(progress * BAR_WIDTH);
         if (barFilled != lastBarFilled) {
             lastBarFilled = barFilled;

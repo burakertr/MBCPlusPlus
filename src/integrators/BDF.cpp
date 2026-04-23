@@ -1,4 +1,5 @@
 #include "mb/integrators/BDF.h"
+#include "mb/math/MatrixN.h"
 #include <cmath>
 
 namespace mb {
@@ -230,102 +231,261 @@ StepResult HHTAlpha::step(double t, StateVector& state, double dt,
             q_pred[qo+j] = state.q[qo+j] + dt * qdot_n[qo+j];
     }
 
-    // ── Step 3: Fixed-point corrector ────────────────────────────────────────
-    //
-    // COUPLED DAE (kktSolver_ set):
-    //   Build (q_{n+1}^k, v_{n+1}^k) from Newmark formulas.
-    //   Evaluate α-interpolated state: q_α, v_α.
-    //   Solve KKT at (t_α, q_α, v_α) → (a^{k+1}, λ^{k+1}) simultaneously.
-    //   M(q_α)*a + Cq(q_α)^T*λ = Q(t_α, q_α, v_α)
-    //   Cq(q_α)*a               = γ(q_α, v_α)
-    //   → constraint forces λ are consistent with dynamics at every iteration.
-    //
-    // FALLBACK (no kktSolver_):
-    //   Evaluate EOM via derivative function (split-operator, previous behaviour).
+    // ── Step 3: Nonlinear coupled DAE Newton solve ──────────────────────────
     std::vector<double> a_new(aPrev_);
     std::vector<double> lambda_new(lambdaPrev_);
-    // q_{n+1} tracked across iterations for iterative quaternion update
     std::vector<double> q_np1(q_pred);
+    std::vector<double> v_np1(v_pred);
+    bool converged = false;
 
-    for (int iter = 0; iter < maxIter_; iter++) {
-        // v_{n+1}^k = ṽ + dt*γ*a^k
-        std::vector<double> v_np1(nv);
-        for (int i = 0; i < nv; i++)
-            v_np1[i] = v_pred[i] + dt * gamma_c * a_new[i];
-
-        // q_{n+1}^k: translation via Newmark β, rotation via iterative trapezoidal
-        std::vector<double> q_np1_new(nq);
+    if (daeResidualFn_) {
+        std::vector<int> dynDofs;
+        dynDofs.reserve(nv);
         for (int b = 0; b < nb; b++) {
-            const int qo  = state.qOffsets[b];
-            const int vo  = state.vOffsets[b];
-            const int nqb = state.nqPerBody[b];
-            const int nvb = state.nvPerBody[b];
-            const int nt  = std::min(3, std::min(nqb, nvb));
+            bool isDyn = (b < (int)state.dynamicBody.size()) ? state.dynamicBody[b] : true;
+            if (!isDyn) continue;
+            int vo = state.vOffsets[b];
+            for (int j = 0; j < state.nvPerBody[b]; j++)
+                dynDofs.push_back(vo + j);
+        }
+        const int nDyn = (int)dynDofs.size();
+        const int nx = nDyn + nc;
 
-            // Translation: x_{n+1} = x̃ + dt²*β*a^k
-            for (int j = 0; j < nt; j++)
-                q_np1_new[qo+j] = q_pred[qo+j] + dt*dt * beta_c * a_new[vo+j];
+        std::vector<double> x(nx, 0.0);
+        for (int i = 0; i < nDyn; i++)
+            x[i] = a_new[dynDofs[i]];
+        for (int i = 0; i < nc && i < (int)lambda_new.size(); i++)
+            x[nDyn + i] = lambda_new[i];
 
-            // Rotation: q_{n+1} = q_n + dt/2*(qdot_n + qdot_{n+1}^k)
-            //   qdot_{n+1}^k = 0.5 * q_np1^{k-1} ⊗ ω_{n+1}^k  (linearized at prev iter)
-            if (nqb == 7 && nvb >= 6) {
-                const double qw = q_np1[qo+3], qx = q_np1[qo+4],
-                             qy = q_np1[qo+5], qz = q_np1[qo+6];
-                const double wx = v_np1[vo+3], wy = v_np1[vo+4], wz = v_np1[vo+5];
-                const double dW = -0.5*(qx*wx + qy*wy + qz*wz);
-                const double dX =  0.5*(qw*wx + qy*wz - qz*wy);
-                const double dY =  0.5*(qw*wy + qz*wx - qx*wz);
-                const double dZ =  0.5*(qw*wz + qx*wy - qy*wx);
-                q_np1_new[qo+3] = state.q[qo+3] + 0.5*dt*(qdot_n[qo+3] + dW);
-                q_np1_new[qo+4] = state.q[qo+4] + 0.5*dt*(qdot_n[qo+4] + dX);
-                q_np1_new[qo+5] = state.q[qo+5] + 0.5*dt*(qdot_n[qo+5] + dY);
-                q_np1_new[qo+6] = state.q[qo+6] + 0.5*dt*(qdot_n[qo+6] + dZ);
-            } else {
-                for (int j = nt; j < nqb; j++)
-                    q_np1_new[qo+j] = q_pred[qo+j];
+        // Chrono-like scaling for position constraints: 1/(beta*h^2)*C.
+        const double constraintScale = 1.0 / std::max(1e-14, beta_c * dt * dt);
+
+        auto evalResidual = [&](const std::vector<double>& xIn,
+                                std::vector<double>& F,
+                                std::vector<double>& aFullOut,
+                                std::vector<double>& lambdaOut,
+                                std::vector<double>& qOut,
+                                std::vector<double>& vOut,
+                                double& maxC,
+                                double& maxCdot,
+                                double& maxDyn) {
+            aFullOut.assign(nv, 0.0);
+            lambdaOut.assign(nc, 0.0);
+            for (int i = 0; i < nDyn; i++)
+                aFullOut[dynDofs[i]] = xIn[i];
+            for (int i = 0; i < nc; i++)
+                lambdaOut[i] = xIn[nDyn + i];
+
+            vOut.resize(nv);
+            for (int i = 0; i < nv; i++)
+                vOut[i] = v_pred[i] + dt * gamma_c * aFullOut[i];
+
+            qOut.resize(nq);
+            for (int b = 0; b < nb; b++) {
+                const int qo  = state.qOffsets[b];
+                const int vo  = state.vOffsets[b];
+                const int nqb = state.nqPerBody[b];
+                const int nvb = state.nvPerBody[b];
+                const int nt  = std::min(3, std::min(nqb, nvb));
+
+                for (int j = 0; j < nt; j++) {
+                    qOut[qo + j] = state.q[qo + j]
+                                 + dt * state.v[vo + j]
+                                 + dt * dt * ((0.5 - beta_c) * aPrev_[vo + j]
+                                            + beta_c * aFullOut[vo + j]);
+                }
+
+                if (nqb == 7 && nvb >= 6) {
+                    const double wn_x = state.v[vo + 3];
+                    const double wn_y = state.v[vo + 4];
+                    const double wn_z = state.v[vo + 5];
+                    const double wp_x = vOut[vo + 3];
+                    const double wp_y = vOut[vo + 4];
+                    const double wp_z = vOut[vo + 5];
+                    const double wx = 0.5 * (wn_x + wp_x);
+                    const double wy = 0.5 * (wn_y + wp_y);
+                    const double wz = 0.5 * (wn_z + wp_z);
+                    const double wNorm = std::sqrt(wx * wx + wy * wy + wz * wz);
+
+                    Quaternion qn(state.q[qo + 3], state.q[qo + 4],
+                                  state.q[qo + 5], state.q[qo + 6]);
+                    Quaternion qnp1 = qn;
+                    if (wNorm > 1e-14) {
+                        const double angle = wNorm * dt;
+                        const double half = 0.5 * angle;
+                        const double s = std::sin(half) / wNorm;
+                        Quaternion dq(std::cos(half), wx * s, wy * s, wz * s);
+                        qnp1 = dq.multiply(qn).normalize();
+                    }
+                    qOut[qo + 3] = qnp1.w;
+                    qOut[qo + 4] = qnp1.x;
+                    qOut[qo + 5] = qnp1.y;
+                    qOut[qo + 6] = qnp1.z;
+                } else {
+                    for (int j = nt; j < nqb; j++)
+                        qOut[qo + j] = q_pred[qo + j];
+                }
             }
-        }
-        q_np1 = q_np1_new;
 
-        // Build α-interpolated state
-        StateVector s_alpha = state.clone();
-        for (int i = 0; i < nq; i++)
-            s_alpha.q[i] = (1.0 + alpha) * q_np1[i] - alpha * state.q[i];
-        for (int i = 0; i < nv; i++)
-            s_alpha.v[i] = (1.0 + alpha) * v_np1[i]  - alpha * state.v[i];
-        s_alpha.time = t_alpha;
-        s_alpha.normalizeQuaternions();
-
-        std::vector<double> a_next(nv, 0.0);
-        std::vector<double> lambda_next(nc, 0.0);
-
-        if (kktSolver_) {
-            // ── CORRECT HHT-DAE (Negrut 2007) ──
-            // Forces M,Q and constraint Jacobian Cq at α-state.
-            // Baumgarte feedback γ evaluated at n+1 state (correct time level).
             StateVector s_np1 = state.clone();
-            for (int i = 0; i < nq; i++) s_np1.q[i] = q_np1[i];
-            for (int i = 0; i < nv; i++) s_np1.v[i] = v_np1[i];
             s_np1.time = t + dt;
+            s_np1.q = qOut;
+            s_np1.v = vOut;
             s_np1.normalizeQuaternions();
-            auto r = kktSolver_(t_alpha, s_alpha, s_np1);
-            a_next      = r.accel;
-            lambda_next = r.lambda;
-        } else {
-            // ── FALLBACK ── derivative function (split-operator)
-            auto k = f(t_alpha, s_alpha);
-            for (int i = 0; i < nv; i++) a_next[i] = k.v[i];
-        }
+            qOut = s_np1.q;
 
-        // Convergence: mixed abs+rel tolerance, scale = tol*(1+|a|)
-        double res = 0.0;
-        for (int i = 0; i < nv; i++) {
-            double scale = tol_ * (1.0 + std::abs(a_new[i]));
-            res = std::max(res, std::abs(a_next[i] - a_new[i]) / scale);
+            StateVector s_alpha = state.clone();
+            s_alpha.time = t_alpha;
+            for (int i = 0; i < nq; i++)
+                s_alpha.q[i] = (1.0 + alpha) * s_np1.q[i] - alpha * state.q[i];
+            for (int i = 0; i < nv; i++)
+                s_alpha.v[i] = (1.0 + alpha) * s_np1.v[i] - alpha * state.v[i];
+            s_alpha.normalizeQuaternions();
+
+            std::vector<double> dynResidual, C, Cdot;
+            daeResidualFn_(t_alpha, s_alpha, s_np1, aFullOut, lambdaOut, dynResidual, C, Cdot);
+
+            maxDyn = 0.0;
+            for (double v : dynResidual) maxDyn = std::max(maxDyn, std::abs(v));
+            maxC = 0.0;
+            for (double v : C) maxC = std::max(maxC, std::abs(v));
+            maxCdot = 0.0;
+            for (double v : Cdot) maxCdot = std::max(maxCdot, std::abs(v));
+
+            F.assign(nx, 0.0);
+            for (int i = 0; i < nDyn && i < (int)dynResidual.size(); i++)
+                F[i] = dynResidual[i];
+            for (int i = 0; i < nc; i++) {
+                const double c = (i < (int)C.size()) ? C[i] : 0.0;
+                F[nDyn + i] = constraintScale * c;
+            }
+        };
+
+        const int nonlinearIterMax = std::min(maxIter_, 12);
+        for (int iter = 0; iter < nonlinearIterMax; iter++) {
+            std::vector<double> F, aEval, lamEval, qEval, vEval;
+            double maxC = 0.0, maxCdot = 0.0, maxDyn = 0.0;
+            evalResidual(x, F, aEval, lamEval, qEval, vEval, maxC, maxCdot, maxDyn);
+
+            const double dynTol = tol_;
+            const double conTol = std::min(tol_, 1e-12);
+            if (maxDyn <= dynTol && maxC <= conTol) {
+                a_new = aEval;
+                lambda_new = lamEval;
+                q_np1 = qEval;
+                v_np1 = vEval;
+                converged = true;
+                break;
+            }
+
+            MatrixN J(nx, nx);
+            for (int col = 0; col < nx; col++) {
+                std::vector<double> xPert = x;
+                double h = 1e-7 * (1.0 + std::abs(x[col]));
+                xPert[col] += h;
+
+                std::vector<double> Fp, aTmp, lTmp, qTmp, vTmp;
+                double cTmp = 0.0, cdTmp = 0.0, dTmp = 0.0;
+                evalResidual(xPert, Fp, aTmp, lTmp, qTmp, vTmp, cTmp, cdTmp, dTmp);
+
+                for (int row = 0; row < nx; row++) {
+                    double deriv = (Fp[row] - F[row]) / h;
+                    J.set(row, col, deriv);
+                }
+            }
+
+            std::vector<double> rhs(nx, 0.0);
+            for (int i = 0; i < nx; i++) rhs[i] = -F[i];
+            std::vector<double> dx = J.solve(rhs);
+
+            double baseNorm = 0.0;
+            for (double v : F) baseNorm = std::max(baseNorm, std::abs(v));
+            double lsAlpha = 1.0;
+            std::vector<double> xTrial = x;
+            bool acceptedStep = false;
+
+            for (int ls = 0; ls < 8; ls++) {
+                for (int i = 0; i < nx; i++)
+                    xTrial[i] = x[i] + lsAlpha * dx[i];
+
+                std::vector<double> Ft, aTmp, lTmp, qTmp, vTmp;
+                double cTmp = 0.0, cdTmp = 0.0, dTmp = 0.0;
+                evalResidual(xTrial, Ft, aTmp, lTmp, qTmp, vTmp, cTmp, cdTmp, dTmp);
+
+                double trialNorm = 0.0;
+                for (double v : Ft) trialNorm = std::max(trialNorm, std::abs(v));
+                if (trialNorm < baseNorm) {
+                    acceptedStep = true;
+                    break;
+                }
+                lsAlpha *= 0.5;
+            }
+
+            if (!acceptedStep) break;
+            x = xTrial;
         }
-        a_new      = a_next;
-        lambda_new = lambda_next;
-        if (res < 1.0) break;
+    } else {
+        // Fallback: previous split/coupled fixed-point style if residual callback not provided.
+        for (int iter = 0; iter < maxIter_; iter++) {
+            for (int i = 0; i < nv; i++)
+                v_np1[i] = v_pred[i] + dt * gamma_c * a_new[i];
+
+            for (int b = 0; b < nb; b++) {
+                const int qo  = state.qOffsets[b];
+                const int vo  = state.vOffsets[b];
+                const int nqb = state.nqPerBody[b];
+                const int nvb = state.nvPerBody[b];
+                const int nt  = std::min(3, std::min(nqb, nvb));
+                for (int j = 0; j < nt; j++) {
+                    q_np1[qo + j] = state.q[qo + j]
+                                  + dt * state.v[vo + j]
+                                  + dt * dt * ((0.5 - beta_c) * aPrev_[vo + j]
+                                             + beta_c * a_new[vo + j]);
+                }
+            }
+
+            StateVector s_alpha = state.clone();
+            for (int i = 0; i < nq; i++)
+                s_alpha.q[i] = (1.0 + alpha) * q_np1[i] - alpha * state.q[i];
+            for (int i = 0; i < nv; i++)
+                s_alpha.v[i] = (1.0 + alpha) * v_np1[i] - alpha * state.v[i];
+            s_alpha.time = t_alpha;
+            s_alpha.normalizeQuaternions();
+
+            std::vector<double> a_next(nv, 0.0);
+            std::vector<double> lambda_next(nc, 0.0);
+            if (kktSolver_) {
+                StateVector s_np1 = state.clone();
+                s_np1.q = q_np1;
+                s_np1.v = v_np1;
+                s_np1.time = t + dt;
+                s_np1.normalizeQuaternions();
+                auto r = kktSolver_(t_alpha, s_alpha, s_np1);
+                a_next = r.accel;
+                lambda_next = r.lambda;
+                if (r.maxPositionViolation <= tol_ && r.maxVelocityViolation <= tol_) {
+                    a_new = a_next;
+                    lambda_new = lambda_next;
+                    q_np1 = s_np1.q;
+                    converged = true;
+                    break;
+                }
+            } else {
+                auto k = f(t_alpha, s_alpha);
+                for (int i = 0; i < nv; i++) a_next[i] = k.v[i];
+                a_new = a_next;
+                converged = true;
+                break;
+            }
+            a_new = a_next;
+            lambda_new = lambda_next;
+        }
+    }
+
+    if (!converged) {
+        const double nextDt = std::max(config_.minStep, dt * 0.5);
+        if (dt > config_.minStep * (1.0 + 1e-12))
+            return {state.clone(), dt, nextDt, false};
     }
 
     // ── Step 4: Assemble final state ─────────────────────────────────────────
@@ -342,7 +502,8 @@ StepResult HHTAlpha::step(double t, StateVector& state, double dt,
     result.normalizeQuaternions();
 
     aPrev_      = a_new;
-    lambdaPrev_ = lambda_new;    return {result, dt, dt, true};
+    lambdaPrev_ = lambda_new;
+    return {result, dt, dt, true};
 }
 
 } // namespace mb

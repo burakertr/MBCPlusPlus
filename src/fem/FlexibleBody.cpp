@@ -62,15 +62,11 @@ std::shared_ptr<FlexibleBody> FlexibleBody::fromMesh(
         body->elements.emplace_back(conn, body->nodes, *body->material, highOrderQuad);
     }
 
-    // Lock gradient DOFs (3..11 per node).  The current formulation computes
-    // F = Σ dNa/dX · r_a  (standard linear-tet), so elastic forces only act
-    // on position DOFs.  Gradient DOFs carry mass but no stiffness — leaving
-    // them free causes immediate divergence.  Fixing them gives a correct
-    // standard FEM with 3 translational DOFs per node.
-    for (auto& nd : body->nodes) {
-        for (int d = 3; d < ANCF_NODE_DOF; d++)
-            nd.fixedDOF[d] = true;
-    }
+    // Full ANCF formulation: gradient DOFs (3..11) are FREE.
+    // The deformation gradient F is interpolated from gradient DOFs
+    // at each node, and elastic forces act on all 48 DOFs per element.
+    // Gradient DOFs are initialized to F = I (identity) in the
+    // undeformed configuration (already set above).
 
     body->numDof = (int)body->nodes.size() * ANCF_NODE_DOF;
     body->rebuildDofMap();
@@ -353,36 +349,54 @@ std::vector<double> FlexibleBody::computeTotalForces() {
         }
     }
 
-    // Gradient penalty: pull F toward nearest rotation (using R≈I approximation)
-    if (gradientPenalty > 0) {
-        int nNodesGP = (int)nodes.size();
-        #pragma omp parallel for schedule(static)
-        for (int ni = 0; ni < nNodesGP; ni++) {
-            int off = ni * ANCF_NODE_DOF;
-            const auto& nd = nodes[ni];
+    // ── ANCF Gradient Consistency ─────────────────────────────
+    // Pull gradient DOFs toward the position-derived F.
+    // For each node, compute a volume-weighted average of the
+    // element-level deformation gradients (from position DOFs),
+    // then apply a penalty force:
+    //   Q_grad[d] -= κ · (F_grad[d] - F_pos[d])
+    // where κ = gradientPenalty (should be large, e.g. E * V0_avg).
+    //
+    // The default penalty auto-scales from material stiffness.
+    {
+        // Compute penalty stiffness if auto (gradientPenalty <= 0 uses auto)
+        double kappa = gradientPenalty;
+        if (kappa <= 0) {
+            // Auto-scale: κ = E (Young's modulus) — strong enough to enforce consistency
+            kappa = materialProps.E;
+        }
 
-            // Extract F, compute nearest rotation via iterative polar decomposition
-            double f00 = nd.q[3], f10 = nd.q[4], f20 = nd.q[5];
-            double f01 = nd.q[6], f11 = nd.q[7], f21 = nd.q[8];
-            double f02 = nd.q[9], f12 = nd.q[10], f22 = nd.q[11];
+        // Accumulate volume-weighted F from elements for each node
+        int nNodes = (int)nodes.size();
+        std::vector<double> Faccum(nNodes * 9, 0.0);
+        std::vector<double> Vaccum(nNodes, 0.0);
 
-            for (int iter = 0; iter < 3; iter++) {
-                double det = f00*(f11*f22-f12*f21) - f01*(f10*f22-f12*f20) + f02*(f10*f21-f11*f20);
-                if (std::abs(det) < 1e-20) break;
-                double invDet = 1.0/det;
-                double c00=(f11*f22-f12*f21)*invDet, c10=-(f01*f22-f02*f21)*invDet, c20=(f01*f12-f02*f11)*invDet;
-                double c01=-(f10*f22-f12*f20)*invDet, c11=(f00*f22-f02*f20)*invDet, c21=-(f00*f12-f02*f10)*invDet;
-                double c02=(f10*f21-f11*f20)*invDet, c12=-(f00*f21-f01*f20)*invDet, c22=(f00*f11-f01*f10)*invDet;
-                f00=0.5*(f00+c00); f10=0.5*(f10+c10); f20=0.5*(f20+c20);
-                f01=0.5*(f01+c01); f11=0.5*(f11+c11); f21=0.5*(f21+c21);
-                f02=0.5*(f02+c02); f12=0.5*(f12+c12); f22=0.5*(f22+c22);
+        for (const auto& elem : elements) {
+            if (!elem.alive) continue;
+            double Felem[9];
+            elem.computePositionBasedF(nodes, Felem);
+            double vol = elem.V0;
+            for (int k = 0; k < 4; k++) {
+                int nid = elem.nodeIds[k];
+                Vaccum[nid] += vol;
+                for (int d = 0; d < 9; d++)
+                    Faccum[nid * 9 + d] += vol * Felem[d];
             }
+        }
 
-            double R[9] = {f00,f10,f20, f01,f11,f21, f02,f12,f22};
+        // Apply penalty
+        #pragma omp parallel for schedule(static)
+        for (int ni = 0; ni < nNodes; ni++) {
+            if (Vaccum[ni] < 1e-30) continue;
+            int off = ni * ANCF_NODE_DOF;
+            double invV = 1.0 / Vaccum[ni];
             for (int d = 0; d < 9; d++) {
                 int gDof = off + 3 + d;
-                if (!fixedDofMask_[gDof])
-                    Q[gDof] -= gradientPenalty * (nd.q[3+d] - R[d]);
+                if (!fixedDofMask_[gDof]) {
+                    double Ftarget = Faccum[ni * 9 + d] * invV;
+                    double Fcurrent = nodes[ni].q[3 + d];
+                    Q[gDof] -= kappa * (Fcurrent - Ftarget);
+                }
             }
         }
     }
@@ -392,6 +406,68 @@ std::vector<double> FlexibleBody::computeTotalForces() {
         if (fixedDofMask_[i]) Q[i] = 0;
 
     return Q;
+}
+
+// ─── Stiffness Matrix Assembly ───────────────────────────────
+
+std::vector<double> FlexibleBody::assembleStiffnessMatrix() {
+    int n = numDof;
+    std::vector<double> K(n * n, 0.0);
+    int nElem = (int)elements.size();
+
+    #pragma omp parallel
+    {
+        std::vector<double> Kloc(n * n, 0.0);
+        #pragma omp for schedule(dynamic) nowait
+        for (int ei = 0; ei < nElem; ei++) {
+            if (!elements[ei].alive) continue;
+            const auto& elem = elements[ei];
+            auto Ke = elem.computeStiffnessMatrix(nodes);
+            const auto& nids = elem.nodeIds;
+
+            for (int a = 0; a < 4; a++)
+                for (int b = 0; b < 4; b++) {
+                    int gA = nids[a] * ANCF_NODE_DOF;
+                    int gB = nids[b] * ANCF_NODE_DOF;
+                    for (int i = 0; i < ANCF_NODE_DOF; i++)
+                        for (int j = 0; j < ANCF_NODE_DOF; j++) {
+                            int eRow = a * ANCF_NODE_DOF + i;
+                            int eCol = b * ANCF_NODE_DOF + j;
+                            Kloc[(gA+i)*n + (gB+j)] += Ke[eRow*48+eCol];
+                        }
+                }
+        }
+        #pragma omp critical
+        for (int i = 0; i < n * n; i++) K[i] += Kloc[i];
+    }
+
+    // Add gradient consistency penalty stiffness: κ·I on gradient DOFs
+    {
+        double kappa = gradientPenalty;
+        if (kappa <= 0) kappa = materialProps.E;
+
+        int nNodes = (int)nodes.size();
+        for (int ni = 0; ni < nNodes; ni++) {
+            int off = ni * ANCF_NODE_DOF;
+            for (int d = 3; d < ANCF_NODE_DOF; d++) {
+                int gDof = off + d;
+                if (!fixedDofMask_[gDof])
+                    K[gDof * n + gDof] += kappa;
+            }
+        }
+    }
+
+    // Zero rows/cols for fixed DOFs
+    for (int d = 0; d < n; d++) {
+        if (fixedDofMask_[d]) {
+            for (int j = 0; j < n; j++) {
+                K[d*n+j] = 0;
+                K[j*n+d] = 0;
+            }
+        }
+    }
+
+    return K;
 }
 
 // ─── Analysis ────────────────────────────────────────────────

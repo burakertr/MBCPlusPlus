@@ -78,6 +78,11 @@ public:
     std::vector<double> computeGravityForces();
     std::vector<double> computeTotalForces();
 
+    // ─── Stiffness Matrix (for implicit integrators) ─────────
+
+    /// Assemble global tangent stiffness matrix K (numDof×numDof, row-major)
+    std::vector<double> assembleStiffnessMatrix();
+
     // ─── Analysis ────────────────────────────────────────────
 
     double computeStrainEnergy() const;

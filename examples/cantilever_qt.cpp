@@ -46,24 +46,24 @@ static constexpr double BEAM_Lx   = 1.0;     // length (m)
 static constexpr double BEAM_Ly   = 0.05;    // height (m)
 static constexpr double BEAM_Lz   = 0.05;    // depth  (m)
 static constexpr int    MESH_NX   = 10;
-static constexpr int    MESH_NY   = 2;
-static constexpr int    MESH_NZ   = 2;
+static constexpr int    MESH_NY   = 1;
+static constexpr int    MESH_NZ   = 1;
 
 // Material (Neo-Hookean — stable under large deformation)
 // E=2e8 Pa gives ~23 cm static tip deflection (visible but no element inversion)
-static constexpr double MAT_E     = 70e4;     // Pa
+static constexpr double MAT_E     = 70e9;     // Pa
 static constexpr double MAT_NU    = 0.3;
-static constexpr double MAT_RHO   = 780.0;  // kg/m³
+static constexpr double MAT_RHO   = 7800.0;   // kg/m³
 
 // ─────────────────────────────────────────────
 //  Simulation state
 // ─────────────────────────────────────────────
 struct Simulation {
     std::shared_ptr<FlexibleBody> body;
-    std::unique_ptr<FlexDOPRI45> dopri;
+    std::unique_ptr<FlexHHTIntegrator> hht;
     std::unique_ptr<FlexibleBodyIntegrator> rk4Int;
 
-    double dtFrame   = 0.01;      // 10 ms wall-time per frame
+    double dtFrame   = 0.001;     // 1 ms per frame (smaller for stability with full ANCF)
     double time      = 0;
 
     FlexStepResult lastResult{};
@@ -86,11 +86,12 @@ struct Simulation {
         // Fix the left face (x ≈ 0)
         body->fixNodesOnPlane('x', 0.0, 1e-6);
 
-        dopri = std::make_unique<FlexDOPRI45>(*body);
-        dopri->absTol  = 1e-8;
-        dopri->relTol  = 1e-6;
-        dopri->maxStep = 0.005;
-        dopri->dtCurrent = 1e-4;
+        hht = std::make_unique<FlexHHTIntegrator>(*body);
+        hht->alpha = -0.3;           // strong numerical damping for stability
+        hht->newtonTol = 1e-3;
+        hht->maxNewtonIter = 50;
+        hht->useAnalyticStiffness = true;   // analytic stiffness with penalty
+        hht->verbose = false;
 
         rk4Int = std::make_unique<FlexibleBodyIntegrator>(*body);
 
@@ -99,7 +100,7 @@ struct Simulation {
     }
 
     void step() {
-        lastResult = dopri->step(dtFrame);
+        lastResult = hht->step(dtFrame);
         time += dtFrame;
         updateRenderData();
     }
@@ -446,9 +447,9 @@ private:
 
         line(QString("t = %1 s").arg(sim_.time, 0, 'f', 4));
         line(QString("FPS  %1").arg(fps, 0, 'f', 1));
-        line(QString("Integrator: DOPRI45 (adaptive)"));
-        line(QString("dt_adapt = %1 ms").arg(sim_.dopri->dtCurrent * 1e3, 0, 'f', 4));
-        line(QString("steps %1  rejects %2").arg(sim_.dopri->totalSteps).arg(sim_.dopri->totalRejects));
+        line(QString("Integrator: HHT-α (α=%1)").arg(sim_.hht->alpha, 0, 'f', 2));
+        line(QString("Newton iters: %1  |R|=%2").arg(sim_.hht->lastNewtonIters()).arg(sim_.hht->lastResidualNorm(), 0, 'e', 2));
+        line(QString("Total steps: %1").arg(sim_.hht->totalSteps()));
         line(QString(""));
         line(QString("DOFs: %1  (free %2)")
              .arg(sim_.body->numDof).arg(sim_.body->numFreeDof()));

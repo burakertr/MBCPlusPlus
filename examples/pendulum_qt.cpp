@@ -30,7 +30,7 @@
 
 #include "mb/core/RigidBody.h"
 #include "mb/constraints/SphericalJoint.h"
-#include "mb/solvers/DirectSolver.h"
+#include "mb/solvers/NewtonRaphson.h"
 #include "mb/integrators/RungeKutta.h"
 #include "mb/system/MultibodySystem.h"
 #include "mb/core/ThreadConfig.h"
@@ -41,7 +41,7 @@
 using namespace mb;
 static constexpr double DT          = 0.005;   // adım [s]
 static constexpr double T_END       = 30.0;    // simülasyon süresi [s]
-static constexpr double HHT_ALPHA   =  -0.2;    // 0 → Newmark ort. ivme → enerji korunan
+static constexpr double HHT_ALPHA   =  -0.02;   // daha düşük sayısal sönüm
 static constexpr double HHT_RELTOL  = 1e-4;   // Newton göreli tolerans
 static constexpr double HHT_ABSTOL  = 1e-6;   // Newton mutlak tolerans
 // ─────────────────────────────────────────────
@@ -112,7 +112,11 @@ struct Simulation {
             Vec3(0, length1 * 0.5, 0), Vec3(0, -length2 * 0.5, 0), "J2");
         sys.addConstraint(joint2);
 
-        sys.setSolver(std::make_shared<DirectSolver>());
+        SolverConfig solverCfg;
+        solverCfg.maxIterations = 25;
+        solverCfg.tolerance = 1e-10;
+        solverCfg.warmStart = true;
+        sys.setSolver(std::make_shared<NewtonRaphsonSolver>(solverCfg));
 
         // Tight adaptive integrator — important for chaotic double pendulum
         mb::IntegratorConfig cfg;

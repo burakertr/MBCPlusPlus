@@ -15,6 +15,7 @@ StateVector StateVector::fromBodies(const std::vector<Body*>& bodies, int numCon
         s.vOffsets.push_back(s.totalNv);
         s.nqPerBody.push_back(body->nq());
         s.nvPerBody.push_back(body->nv());
+        s.dynamicBody.push_back(body->isDynamic());
         s.totalNq += body->nq();
         s.totalNv += body->nv();
     }
@@ -43,6 +44,7 @@ StateVector StateVector::clone() const {
     s.vOffsets = vOffsets;
     s.nqPerBody = nqPerBody;
     s.nvPerBody = nvPerBody;
+    s.dynamicBody = dynamicBody;
     s.numBodies = numBodies;
     s.numConstraints = numConstraints;
     s.totalNq = totalNq;
@@ -60,6 +62,7 @@ void StateVector::copyFrom(const StateVector& other) {
     vOffsets = other.vOffsets;
     nqPerBody = other.nqPerBody;
     nvPerBody = other.nvPerBody;
+    dynamicBody = other.dynamicBody;
     numBodies = other.numBodies;
     numConstraints = other.numConstraints;
     totalNq = other.totalNq;

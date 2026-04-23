@@ -24,6 +24,7 @@ public:
     std::vector<int> vOffsets;
     std::vector<int> nqPerBody;
     std::vector<int> nvPerBody;
+    std::vector<bool> dynamicBody;
 
     int numBodies = 0;
     int numConstraints = 0;

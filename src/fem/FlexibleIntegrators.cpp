@@ -245,6 +245,249 @@ FlexStepResult FlexDOPRI45::step(double dtTarget) {
     return {body_.getMaxDisplacement(), SE, KE, PE};
 }
 
+// ═══════════════════════════════════════════════════════════════
+//  FlexHHTIntegrator — Full HHT-α for ANCF Flexible Bodies
+// ═══════════════════════════════════════════════════════════════
+
+FlexHHTIntegrator::FlexHHTIntegrator(FlexibleBody& body)
+    : body_(body), aPrev_(body.numDof, 0.0), Qprev_(body.numDof, 0.0) {}
+
+std::vector<int> FlexHHTIntegrator::getFreeDofMap() const {
+    int n = body_.numDof;
+    std::vector<int> map;
+    for (int i = 0; i < n; i++)
+        if (!body_.isDofFixed(i)) map.push_back(i);
+    return map;
+}
+
+std::vector<double> FlexHHTIntegrator::solveDenseLU(
+    std::vector<double>& A, const std::vector<double>& b, int n)
+{
+    std::vector<int> piv(n);
+    for (int i = 0; i < n; i++) piv[i] = i;
+
+    for (int k = 0; k < n; k++) {
+        double maxVal = std::abs(A[piv[k]*n+k]);
+        int maxRow = k;
+        for (int i = k+1; i < n; i++) {
+            double val = std::abs(A[piv[i]*n+k]);
+            if (val > maxVal) { maxVal = val; maxRow = i; }
+        }
+        if (maxRow != k) std::swap(piv[k], piv[maxRow]);
+
+        double pkk = A[piv[k]*n+k];
+        if (std::abs(pkk) < 1e-30) continue;
+
+        for (int i = k+1; i < n; i++) {
+            double factor = A[piv[i]*n+k] / pkk;
+            A[piv[i]*n+k] = factor;
+            for (int j = k+1; j < n; j++)
+                A[piv[i]*n+j] -= factor * A[piv[k]*n+j];
+        }
+    }
+
+    std::vector<double> y(n);
+    for (int i = 0; i < n; i++) {
+        y[i] = b[piv[i]];
+        for (int j = 0; j < i; j++) y[i] -= A[piv[i]*n+j] * y[j];
+    }
+    std::vector<double> x(n);
+    for (int i = n-1; i >= 0; i--) {
+        x[i] = y[i];
+        for (int j = i+1; j < n; j++) x[i] -= A[piv[i]*n+j] * x[j];
+        double d = A[piv[i]*n+i];
+        if (std::abs(d) > 1e-30) x[i] /= d; else x[i] = 0;
+    }
+    return x;
+}
+
+FlexStepResult FlexHHTIntegrator::step(double dt) {
+    int n = body_.numDof;
+
+    // HHT-α parameters
+    double alphaHHT = std::clamp(alpha, -1.0/3.0, 0.0);
+    double betaN  = 0.25 * (1.0 - alphaHHT) * (1.0 - alphaHHT);
+    double gammaN = 0.5 - alphaHHT;
+    double h = dt, h2 = h * h;
+    double alphaF = 1.0 + alphaHHT;  // force scaling factor (1+α)
+
+    auto freeMap = getFreeDofMap();
+    int nf = (int)freeMap.size();
+
+    // Save current state
+    auto q0 = body_.getFlexQ();
+    auto v0 = body_.getFlexQd();
+
+    // Compute forces at current state Q_n (needed for HHT α-blending)
+    if (stepCount_ == 0) {
+        body_.setFlexQ(q0);
+        body_.setFlexQd(v0);
+        Qprev_ = body_.computeTotalForces();
+
+        // Initial acceleration from M·a = Q
+        const auto& M = body_.getGlobalMassMatrix();
+        // Solve M·a = Q for free DOFs using diagonal approximation for initial guess
+        auto Mdiag = body_.getMassDiagonalInverse();
+        for (int i = 0; i < n; i++)
+            aPrev_[i] = body_.isDofFixed(i) ? 0.0 : Mdiag[i] * Qprev_[i];
+    }
+
+    // ─── Predictor ───────────────────────────────────────────
+    std::vector<double> qPred(n), vPred(n);
+    for (int i = 0; i < n; i++) {
+        qPred[i] = q0[i] + h * v0[i] + (0.5 - betaN) * h2 * aPrev_[i];
+        vPred[i] = v0[i] + (1.0 - gammaN) * h * aPrev_[i];
+    }
+
+    // ─── Newton-Raphson iteration on acceleration ────────────
+    // Unknown: a_{n+1}
+    // q_{n+1} = qPred + β·h²·a_{n+1}
+    // v_{n+1} = vPred + γ·h·a_{n+1}
+    //
+    // Residual:
+    //   R = M·a_{n+1} - [(1+α)·Q(q_{n+1}, v_{n+1}) - α·Q_n]
+    //     = M·a_{n+1} - (1+α)·Q_{n+1} + α·Q_n
+    //
+    // Tangent:
+    //   S = M + (1+α)·β·h²·K + (1+α)·γ·h·C
+    //
+    // where K = -∂Q_elastic/∂q (tangent stiffness)
+    //       C = α_damp · M    (Rayleigh mass-proportional damping)
+
+    std::vector<double> a = aPrev_;   // initial guess
+    std::vector<double> qCurr(n), vCurr(n);
+
+    const auto& M = body_.getGlobalMassMatrix();
+
+    for (int newtonIter = 0; newtonIter < maxNewtonIter; newtonIter++) {
+        // Update state from current acceleration guess
+        for (int i = 0; i < n; i++) {
+            qCurr[i] = qPred[i] + betaN * h2 * a[i];
+            vCurr[i] = vPred[i] + gammaN * h * a[i];
+        }
+
+        body_.setFlexQ(qCurr);
+        body_.setFlexQd(vCurr);
+        auto Qcurr = body_.computeTotalForces();
+
+        // ─── Residual (reduced system, free DOFs only) ───
+        std::vector<double> R(nf);
+        for (int ii = 0; ii < nf; ii++) {
+            int i = freeMap[ii];
+            double Ma_i = 0;
+            for (int jj = 0; jj < nf; jj++)
+                Ma_i += M[i * n + freeMap[jj]] * a[freeMap[jj]];
+            double Qeff = alphaF * Qcurr[i] - alphaHHT * Qprev_[i];
+            R[ii] = Ma_i - Qeff;
+        }
+
+        // Check convergence
+        double rNorm = 0;
+        for (int ii = 0; ii < nf; ii++) rNorm += R[ii] * R[ii];
+        rNorm = std::sqrt(rNorm);
+
+        if (verbose) {
+            std::cout << "  HHT step " << stepCount_ << " Newton " << newtonIter
+                      << ": |R| = " << rNorm << std::endl;
+        }
+
+        lastIters_ = newtonIter + 1;
+        lastResNorm_ = rNorm;
+
+        if (rNorm < newtonTol) break;
+
+        // ─── Build tangent matrix S (nf × nf) ───────────
+        std::vector<double> S(nf * nf, 0.0);
+
+        // Start with M (free DOFs block)
+        for (int ii = 0; ii < nf; ii++)
+            for (int jj = 0; jj < nf; jj++)
+                S[ii * nf + jj] = M[freeMap[ii] * n + freeMap[jj]];
+
+        // Add Rayleigh mass-proportional damping: (1+α)·γ·h·α_damp·M
+        if (body_.dampingAlpha > 0) {
+            double dampFactor = alphaF * gammaN * h * body_.dampingAlpha;
+            for (int ii = 0; ii < nf; ii++)
+                for (int jj = 0; jj < nf; jj++)
+                    S[ii * nf + jj] += dampFactor * M[freeMap[ii] * n + freeMap[jj]];
+        }
+
+        // Add stiffness: (1+α)·β·h²·K
+        if (useAnalyticStiffness) {
+            // Use analytic stiffness matrix from element assembly
+            auto Kglobal = body_.assembleStiffnessMatrix();
+            double stiffFactor = alphaF * betaN * h2;
+            for (int ii = 0; ii < nf; ii++)
+                for (int jj = 0; jj < nf; jj++)
+                    S[ii * nf + jj] += stiffFactor * Kglobal[freeMap[ii] * n + freeMap[jj]];
+        } else {
+            // Finite-difference stiffness: K_ij ≈ -(Q(q+ε·ej) - Q(q-ε·ej)) / (2ε)
+            double stiffFactor = alphaF * betaN * h2;
+            for (int jj = 0; jj < nf; jj++) {
+                int j = freeMap[jj];
+                double eps_j = fdEps * std::max(std::abs(qCurr[j]), 1.0);
+
+                auto qPlus = qCurr;
+                qPlus[j] += eps_j;
+                body_.setFlexQ(qPlus);
+                body_.setFlexQd(vCurr);
+                auto QPlus = body_.computeTotalForces();
+
+                auto qMinus = qCurr;
+                qMinus[j] -= eps_j;
+                body_.setFlexQ(qMinus);
+                body_.setFlexQd(vCurr);
+                auto QMinus = body_.computeTotalForces();
+
+                for (int ii = 0; ii < nf; ii++) {
+                    double dQdq = (QPlus[freeMap[ii]] - QMinus[freeMap[ii]]) / (2.0 * eps_j);
+                    S[ii * nf + jj] -= stiffFactor * dQdq;
+                }
+            }
+            // Restore state
+            body_.setFlexQ(qCurr);
+            body_.setFlexQd(vCurr);
+        }
+
+        // ─── Solve S · Δa = -R ──────────────────────────
+        std::vector<double> negR(nf);
+        for (int ii = 0; ii < nf; ii++) negR[ii] = -R[ii];
+        auto da = solveDenseLU(S, negR, nf);
+
+        // Check for zero correction (singular tangent)
+        double daNorm = 0;
+        for (int ii = 0; ii < nf; ii++) daNorm += da[ii] * da[ii];
+        daNorm = std::sqrt(daNorm);
+        if (daNorm < 1e-30) break;  // tangent is singular, can't improve
+
+        // ─── Full Newton step (no line search — implicit methods are robust) ──
+        for (int ii = 0; ii < nf; ii++)
+            a[freeMap[ii]] += da[ii];
+    }
+
+    // ─── Final state update ──────────────────────────────────
+    for (int i = 0; i < n; i++) {
+        qCurr[i] = qPred[i] + betaN * h2 * a[i];
+        vCurr[i] = vPred[i] + gammaN * h * a[i];
+    }
+    body_.setFlexQ(qCurr);
+    body_.setFlexQd(vCurr);
+
+    // Store for next step
+    Qprev_ = body_.computeTotalForces();
+    aPrev_ = a;
+    stepCount_++;
+
+    double SE = body_.computeStrainEnergy();
+    double KE = body_.computeKineticEnergy();
+    double PE = body_.computePotentialEnergy(body_.gravity) - SE;
+    return {body_.getMaxDisplacement(), SE, KE, PE};
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  ImplicitFlexIntegrator (Legacy — backward compatibility)
+// ═══════════════════════════════════════════════════════════════
+
 ImplicitFlexIntegrator::ImplicitFlexIntegrator(FlexibleBody& body)
     : body_(body), aPrev_(body.numDof, 0.0) {}
 

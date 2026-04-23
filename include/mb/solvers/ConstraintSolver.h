@@ -23,6 +23,8 @@ struct SolverResult {
 struct KKTResult {
     std::vector<double> accel;   ///< Full-state v-space accelerations
     std::vector<double> lambda;  ///< Constraint multipliers
+    double maxPositionViolation = 0.0; ///< max |C(q)| at evaluated state
+    double maxVelocityViolation = 0.0; ///< max |Cdot(q,v)| at evaluated state
 };
 
 /**

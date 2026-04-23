@@ -53,7 +53,7 @@ private:
  *   γ  = 1/2 - α    (unconditionally stable)
  *   β  = (1 - α)²/4 (second-order accurate)
  *
- * Uses fixed-point corrector iteration with optional coupled DAE solve:
+ * Uses Newton-style corrector iteration with optional coupled DAE solve:
  *   - COUPLED mode (setKKTSolver called): M*a + Cq^T*λ = Q, Cq*a = γ
  *     solved simultaneously at the α-interpolated state each iteration.
  *     Constraint forces λ are consistent with the dynamics at every step.
@@ -63,8 +63,8 @@ private:
 class HHTAlpha : public TimeIntegrator {
 public:
     /// @param alpha  Dissipation parameter ∈ [-1/3, 0]  (typical: -0.05 .. -0.1)
-    /// @param maxIter   Fixed-point corrector iterations
-    /// @param tol       Convergence tolerance for accelerations
+    /// @param maxIter   Corrector iterations
+    /// @param tol       Convergence tolerance (used for a/λ and |C|, |Cdot|)
     explicit HHTAlpha(double alpha = -0.05,
                       int    maxIter = 5,
                       double tol    = 1e-6,
@@ -93,6 +93,27 @@ public:
     /// This is the standard HHT-DAE formulation: forces at α, constraints at n+1.
     void setKKTSolver(KKTSolverFn fn) { kktSolver_ = std::move(fn); }
 
+    /// Nonlinear coupled-DAE residual evaluator used by the internal Newton solve.
+    /// Inputs:
+    ///   - s_alpha: alpha-interpolated state used for dynamic residual assembly
+    ///   - s_np1:   end-of-step state used for constraint residual assembly
+    ///   - a_full:  full-state acceleration guess at n+1
+    ///   - lambda:  constraint multiplier guess at n+1
+    /// Outputs:
+    ///   - dynResidual: dynamic residual in dynamic-DOF space
+    ///   - C: position constraint residual at n+1
+    ///   - Cdot: velocity constraint residual at n+1
+    using DAEResidualFn = std::function<void(double t_alpha,
+                                             StateVector& s_alpha,
+                                             StateVector& s_np1,
+                                             const std::vector<double>& a_full,
+                                             const std::vector<double>& lambda,
+                                             std::vector<double>& dynResidual,
+                                             std::vector<double>& C,
+                                             std::vector<double>& Cdot)>;
+
+    void setDAEResidualEvaluator(DAEResidualFn fn) { daeResidualFn_ = std::move(fn); }
+
     /// Directly set aPrev_ after external state modification (e.g., post-projection).
     /// Call this instead of invalidateCache() to preserve Newmark continuity
     /// while updating the predictor base acceleration.
@@ -109,6 +130,7 @@ private:
     std::vector<double> aPrev_;       ///< a_n from previous step
     std::vector<double> lambdaPrev_;  ///< λ_n from previous step (coupled mode)
     KKTSolverFn kktSolver_;           ///< Optional coupled KKT solver
+    DAEResidualFn daeResidualFn_;     ///< Optional nonlinear DAE residual evaluator
 };
 
 /**
