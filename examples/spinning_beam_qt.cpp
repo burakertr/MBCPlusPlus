@@ -40,7 +40,9 @@
 #include "mb/fem/ANCFTypes.h"
 #include "mb/fem/FlexibleBody.h"
 #include "mb/fem/FlexibleIntegrators.h"
+#include "mb/fem/MeshGenerators.h"
 #include "mb/core/ThreadConfig.h"
+
 #include <cstdlib>
 
 using namespace mb;

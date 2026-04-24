@@ -7,6 +7,7 @@
 #include "mb/fem/ANCFTypes.h"
 #include "mb/fem/FlexibleBody.h"
 #include "mb/fem/FlexibleIntegrators.h"
+#include "mb/fem/MeshGenerators.h"
 
 using namespace mb;
 

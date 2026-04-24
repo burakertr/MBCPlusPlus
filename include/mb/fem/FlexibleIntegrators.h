@@ -178,15 +178,4 @@ struct StaticSolveOptions {
 StaticSolveResult solveStaticEquilibrium(FlexibleBody& body,
                                          const StaticSolveOptions& opts = {});
 
-// ─── Mesh Generators ─────────────────────────────────────────
-
-/// Generate a box-shaped tetrahedral mesh
-GmshMesh generateBoxTetMesh(double Lx, double Ly, double Lz,
-                            int nx, int ny, int nz);
-
-/// Generate a cylindrical tetrahedral mesh
-GmshMesh generateCylinderTetMesh(double R, double L,
-                                  int nR, int nT, int nZ,
-                                  double innerRadius = 0);
-
 } // namespace mb

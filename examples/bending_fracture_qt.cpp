@@ -42,6 +42,7 @@
 #include "mb/fem/FlexibleIntegrators.h"
 #include "mb/fem/FlexibleContactManager.h"
 #include "mb/core/ThreadConfig.h"
+#include "mb/fem/MeshGenerators.h"
 
 using namespace mb;
 

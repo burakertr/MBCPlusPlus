@@ -50,16 +50,33 @@ std::shared_ptr<FlexibleBody> FlexibleBody::fromMesh(
         body->nodes.push_back(nd);
     }
 
-    // Build elements
+    // Build elements (tet4 + hex8)
     for (const auto& ge : mesh.elements) {
-        TetConnectivity conn;
-        for (int k = 0; k < 4; k++) {
-            auto it = nodeIdMap.find(ge.nodeIds[k]);
-            if (it == nodeIdMap.end())
-                throw std::runtime_error("Node " + std::to_string(ge.nodeIds[k]) + " not found");
-            conn.nodeIds[k] = it->second;
+        if (ge.type == 4) {
+            if (ge.nodeIds.size() != 4)
+                throw std::runtime_error("Tet element has invalid node count");
+
+            TetConnectivity conn;
+            for (int k = 0; k < 4; k++) {
+                auto it = nodeIdMap.find(ge.nodeIds[k]);
+                if (it == nodeIdMap.end())
+                    throw std::runtime_error("Node " + std::to_string(ge.nodeIds[k]) + " not found");
+                conn.nodeIds[k] = it->second;
+            }
+            body->elements.emplace_back(conn, body->nodes, *body->material, highOrderQuad);
+        } else if (ge.type == 5) {
+            if (ge.nodeIds.size() != 8)
+                throw std::runtime_error("Hex element has invalid node count");
+
+            HexConnectivity conn;
+            for (int k = 0; k < 8; k++) {
+                auto it = nodeIdMap.find(ge.nodeIds[k]);
+                if (it == nodeIdMap.end())
+                    throw std::runtime_error("Node " + std::to_string(ge.nodeIds[k]) + " not found");
+                conn.nodeIds[k] = it->second;
+            }
+            body->hexElements.emplace_back(conn, body->nodes, *body->material, highOrderQuad);
         }
-        body->elements.emplace_back(conn, body->nodes, *body->material, highOrderQuad);
     }
 
     // Full ANCF formulation: gradient DOFs (3..11) are FREE.
@@ -207,6 +224,24 @@ const std::vector<double>& FlexibleBody::getGlobalMassMatrix() {
             }
     }
 
+    for (const auto& elem : hexElements) {
+        if (!elem.alive) continue;
+        auto Me = elem.computeMassMatrix(nodes);
+        const auto& nids = elem.nodeIds;
+
+        for (int a = 0; a < 8; a++)
+            for (int b = 0; b < 8; b++) {
+                int gA = nids[a] * ANCF_NODE_DOF;
+                int gB = nids[b] * ANCF_NODE_DOF;
+                for (int i = 0; i < ANCF_NODE_DOF; i++)
+                    for (int j = 0; j < ANCF_NODE_DOF; j++) {
+                        int eRow = a * ANCF_NODE_DOF + i;
+                        int eCol = b * ANCF_NODE_DOF + j;
+                        globalMass_[(gA+i)*n + (gB+j)] += Me[eRow*ANCF_HEX_ELEM_DOF+eCol];
+                    }
+            }
+    }
+
     // Zero rows/cols for fixed DOFs
     for (int d = 0; d < n; d++) {
         if (fixedDofMask_[d]) {
@@ -271,6 +306,19 @@ void FlexibleBody::syncGradientDOFs() {
         }
     }
 
+    for (const auto& elem : hexElements) {
+        if (!elem.alive) continue;
+        double Felem[9];
+        elem.computePositionBasedF(nodes, Felem);
+        double vol = elem.V0;
+        for (int k = 0; k < 8; k++) {
+            int nid = elem.nodeIds[k];
+            Vaccum[nid] += vol;
+            for (int d = 0; d < 9; d++)
+                Faccum[nid * 9 + d] += vol * Felem[d];
+        }
+    }
+
     for (int ni = 0; ni < nNodes; ni++) {
         if (Vaccum[ni] < 1e-30) continue;
         double invV = 1.0 / Vaccum[ni];
@@ -283,6 +331,7 @@ std::vector<double> FlexibleBody::computeElasticForces() {
     int n = numDof;
     std::vector<double> Q(n, 0.0);
     int nElem = (int)elements.size();
+    int nHex = (int)hexElements.size();
 
     if (positionOnlyMode) {
         // Position-only: compute elastic forces directly from position DOFs.
@@ -376,6 +425,25 @@ std::vector<double> FlexibleBody::computeElasticForces() {
             #pragma omp critical
             for (int i = 0; i < n; i++) Q[i] += Qloc[i];
         }
+
+        #pragma omp parallel
+        {
+            std::vector<double> Qloc(n, 0.0);
+            #pragma omp for schedule(dynamic) nowait
+            for (int ei = 0; ei < nHex; ei++) {
+                if (!hexElements[ei].alive) continue;
+                const auto& elem = hexElements[ei];
+                auto Qe = elem.computeElasticForcesPositionOnly(nodes);
+                const auto& nids = elem.nodeIds;
+                for (int a = 0; a < 8; a++) {
+                    int gOff = nids[a] * ANCF_NODE_DOF;
+                    for (int d = 0; d < ANCF_NODE_DOF; d++)
+                        Qloc[gOff+d] += Qe[a*ANCF_NODE_DOF+d];
+                }
+            }
+            #pragma omp critical
+            for (int i = 0; i < n; i++) Q[i] += Qloc[i];
+        }
     } else {
         // Full ANCF mode (original)
         #pragma omp parallel
@@ -388,6 +456,25 @@ std::vector<double> FlexibleBody::computeElasticForces() {
                 auto Qe = elem.computeElasticForces(nodes);
                 const auto& nids = elem.nodeIds;
                 for (int a = 0; a < 4; a++) {
+                    int gOff = nids[a] * ANCF_NODE_DOF;
+                    for (int d = 0; d < ANCF_NODE_DOF; d++)
+                        Qloc[gOff+d] += Qe[a*ANCF_NODE_DOF+d];
+                }
+            }
+            #pragma omp critical
+            for (int i = 0; i < n; i++) Q[i] += Qloc[i];
+        }
+
+        #pragma omp parallel
+        {
+            std::vector<double> Qloc(n, 0.0);
+            #pragma omp for schedule(dynamic) nowait
+            for (int ei = 0; ei < nHex; ei++) {
+                if (!hexElements[ei].alive) continue;
+                const auto& elem = hexElements[ei];
+                auto Qe = elem.computeElasticForces(nodes);
+                const auto& nids = elem.nodeIds;
+                for (int a = 0; a < 8; a++) {
                     int gOff = nids[a] * ANCF_NODE_DOF;
                     for (int d = 0; d < ANCF_NODE_DOF; d++)
                         Qloc[gOff+d] += Qe[a*ANCF_NODE_DOF+d];
@@ -409,23 +496,36 @@ std::vector<double> FlexibleBody::computeGravityForces() {
     std::vector<double> Q(n, 0.0);
     double gVec[3] = {gravity.x, gravity.y, gravity.z};
 
-    // Compute consistent nodal gravity forces using element-level lumped mass.
-    // Each node accumulates ρ * V0 / 4 from each attached element.
-    // Total gravity = Σ_elem ρ * V0 * g = ρ * V_total * g  ✓
-    //
-    // For fixed nodes, the force is zeroed, but the total force on free nodes
-    // should still be correct (fixed nodes "eat" some force as reactions).
+    // Consistent nodal gravity forces via element-level lumped mass.
+    // Tet: each node of element gets ρ·V0/4·g; Hex: ρ·V0/8·g.
+    // Gravity is applied to ALL nodes including constrained ones so that
+    // Σ Q[..+d] = ρ·V_total·g exactly (no mass is silently dropped).
+    // The solver enforces displacement constraints via freeIdx partitioning;
+    // fixed-DOF gravity entries become wall reaction contributions and do
+    // not affect the free-DOF displacement solution.
     double rho = material->density();
 
+    // Gravity is applied to ALL nodes regardless of constraints.
+    // Fixed DOF entries in Q are ignored by the static/dynamic solver
+    // (the solver only reads freeIdx entries), so they correctly become
+    // wall reaction forces without affecting the displacement solution.
     for (const auto& elem : elements) {
         if (!elem.alive) continue;
         double nodalForce = rho * elem.V0 / 4.0;
         for (int a = 0; a < 4; a++) {
             int gOff = elem.nodeIds[a] * ANCF_NODE_DOF;
-            for (int d = 0; d < 3; d++) {
-                if (!fixedDofMask_[gOff + d])
-                    Q[gOff + d] += nodalForce * gVec[d];
-            }
+            for (int d = 0; d < 3; d++)
+                Q[gOff + d] += nodalForce * gVec[d];
+        }
+    }
+
+    for (const auto& elem : hexElements) {
+        if (!elem.alive) continue;
+        double nodalForce = rho * elem.V0 / 8.0;
+        for (int a = 0; a < 8; a++) {
+            int gOff = elem.nodeIds[a] * ANCF_NODE_DOF;
+            for (int d = 0; d < 3; d++)
+                Q[gOff + d] += nodalForce * gVec[d];
         }
     }
 
@@ -504,6 +604,19 @@ std::vector<double> FlexibleBody::computeTotalForces() {
             }
         }
 
+        for (const auto& elem : hexElements) {
+            if (!elem.alive) continue;
+            double Felem[9];
+            elem.computePositionBasedF(nodes, Felem);
+            double vol = elem.V0;
+            for (int k = 0; k < 8; k++) {
+                int nid = elem.nodeIds[k];
+                Vaccum[nid] += vol;
+                for (int d = 0; d < 9; d++)
+                    Faccum[nid * 9 + d] += vol * Felem[d];
+            }
+        }
+
         #pragma omp parallel for schedule(static)
         for (int ni = 0; ni < nNodes; ni++) {
             if (Vaccum[ni] < 1e-30) continue;
@@ -533,6 +646,7 @@ std::vector<double> FlexibleBody::assembleStiffnessMatrix() {
     int n = numDof;
     std::vector<double> K(n * n, 0.0);
     int nElem = (int)elements.size();
+    int nHex = (int)hexElements.size();
 
     if (positionOnlyMode) {
         // Position-only mode: assemble only pos-pos block directly
@@ -574,6 +688,32 @@ std::vector<double> FlexibleBody::assembleStiffnessMatrix() {
             #pragma omp critical
             for (int i = 0; i < n * n; i++) K[i] += Kloc[i];
         }
+
+        #pragma omp parallel
+        {
+            std::vector<double> Kloc(n * n, 0.0);
+            #pragma omp for schedule(dynamic) nowait
+            for (int ei = 0; ei < nHex; ei++) {
+                if (!hexElements[ei].alive) continue;
+                const auto& elem = hexElements[ei];
+                auto Ke = elem.computeStiffnessMatrixPositionOnly(nodes);
+                const auto& nids = elem.nodeIds;
+
+                for (int a = 0; a < 8; a++)
+                    for (int b = 0; b < 8; b++) {
+                        int gA = nids[a] * ANCF_NODE_DOF;
+                        int gB = nids[b] * ANCF_NODE_DOF;
+                        for (int i = 0; i < ANCF_NODE_DOF; i++)
+                            for (int j = 0; j < ANCF_NODE_DOF; j++) {
+                                int eRow = a * ANCF_NODE_DOF + i;
+                                int eCol = b * ANCF_NODE_DOF + j;
+                                Kloc[(gA+i)*n + (gB+j)] += Ke[eRow*ANCF_HEX_ELEM_DOF+eCol];
+                            }
+                    }
+            }
+            #pragma omp critical
+            for (int i = 0; i < n * n; i++) K[i] += Kloc[i];
+        }
     } else {
         // Full ANCF mode (original)
         #pragma omp parallel
@@ -595,6 +735,32 @@ std::vector<double> FlexibleBody::assembleStiffnessMatrix() {
                                 int eRow = a * ANCF_NODE_DOF + i;
                                 int eCol = b * ANCF_NODE_DOF + j;
                                 Kloc[(gA+i)*n + (gB+j)] += Ke[eRow*48+eCol];
+                            }
+                    }
+            }
+            #pragma omp critical
+            for (int i = 0; i < n * n; i++) K[i] += Kloc[i];
+        }
+
+        #pragma omp parallel
+        {
+            std::vector<double> Kloc(n * n, 0.0);
+            #pragma omp for schedule(dynamic) nowait
+            for (int ei = 0; ei < nHex; ei++) {
+                if (!hexElements[ei].alive) continue;
+                const auto& elem = hexElements[ei];
+                auto Ke = elem.computeStiffnessMatrix(nodes);
+                const auto& nids = elem.nodeIds;
+
+                for (int a = 0; a < 8; a++)
+                    for (int b = 0; b < 8; b++) {
+                        int gA = nids[a] * ANCF_NODE_DOF;
+                        int gB = nids[b] * ANCF_NODE_DOF;
+                        for (int i = 0; i < ANCF_NODE_DOF; i++)
+                            for (int j = 0; j < ANCF_NODE_DOF; j++) {
+                                int eRow = a * ANCF_NODE_DOF + i;
+                                int eCol = b * ANCF_NODE_DOF + j;
+                                Kloc[(gA+i)*n + (gB+j)] += Ke[eRow*ANCF_HEX_ELEM_DOF+eCol];
                             }
                     }
             }
@@ -642,16 +808,40 @@ double FlexibleBody::computeStrainEnergy() const {
         elements[ei].computeDeformationGradient(0.25, 0.25, 0.25, nodes, F);
         W += material->strainEnergyDensity(F) * elements[ei].V0;
     }
+
+    int nHex = (int)hexElements.size();
+    #pragma omp parallel for reduction(+:W) schedule(dynamic)
+    for (int ei = 0; ei < nHex; ei++) {
+        if (!hexElements[ei].alive) continue;
+        double F[9];
+        hexElements[ei].computeDeformationGradient(0.0, 0.0, 0.0, nodes, F);
+        W += material->strainEnergyDensity(F) * hexElements[ei].V0;
+    }
+
     return W;
 }
 
 double FlexibleBody::computeElementVonMises(int elemIdx) const {
-    if (elemIdx < 0 || elemIdx >= (int)elements.size()) return 0;
-    if (!elements[elemIdx].alive) return 0;
+    if (elemIdx < 0) return 0;
 
-    // Deformation gradient at centroid (ξ=η=ζ=0.25 for tet)
+    bool isTet = elemIdx < (int)elements.size();
+    int localIdx = elemIdx;
+    if (!isTet) localIdx -= (int)elements.size();
+
+    if (isTet) {
+        if (localIdx >= (int)elements.size()) return 0;
+        if (!elements[localIdx].alive) return 0;
+    } else {
+        if (localIdx >= (int)hexElements.size()) return 0;
+        if (!hexElements[localIdx].alive) return 0;
+    }
+
+    // Deformation gradient at centroid
     double F[9];
-    elements[elemIdx].computeDeformationGradient(0.25, 0.25, 0.25, nodes, F);
+    if (isTet)
+        elements[localIdx].computeDeformationGradient(0.25, 0.25, 0.25, nodes, F);
+    else
+        hexElements[localIdx].computeDeformationGradient(0.0, 0.0, 0.0, nodes, F);
 
     // Second Piola-Kirchhoff stress S
     double S[9];
@@ -689,9 +879,15 @@ double FlexibleBody::computeElementVonMises(int elemIdx) const {
 void FlexibleBody::removeElements(const std::vector<int>& elemIndices) {
     if (elemIndices.empty()) return;
 
+    int nTet = (int)elements.size();
     for (int idx : elemIndices) {
-        if (idx >= 0 && idx < (int)elements.size())
+        if (idx >= 0 && idx < nTet) {
             elements[idx].alive = false;
+        } else {
+            int h = idx - nTet;
+            if (h >= 0 && h < (int)hexElements.size())
+                hexElements[h].alive = false;
+        }
     }
 
     invalidateMassCache();
@@ -706,6 +902,8 @@ void FlexibleBody::invalidateMassCache() {
 double FlexibleBody::getTotalMass() const {
     double mass = 0;
     for (const auto& elem : elements)
+        if (elem.alive) mass += material->density() * elem.V0;
+    for (const auto& elem : hexElements)
         if (elem.alive) mass += material->density() * elem.V0;
     return mass;
 }
@@ -740,6 +938,14 @@ std::vector<std::array<int,4>> FlexibleBody::getTetConnectivity() const {
     std::vector<std::array<int,4>> conn;
     conn.reserve(elements.size());
     for (const auto& e : elements)
+        if (e.alive) conn.push_back(e.nodeIds);
+    return conn;
+}
+
+std::vector<std::array<int,8>> FlexibleBody::getHexConnectivity() const {
+    std::vector<std::array<int,8>> conn;
+    conn.reserve(hexElements.size());
+    for (const auto& e : hexElements)
         if (e.alive) conn.push_back(e.nodeIds);
     return conn;
 }

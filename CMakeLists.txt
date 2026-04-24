@@ -55,12 +55,14 @@ set(LIB_SOURCES
     # FEM / Flexible Bodies
     src/fem/ElasticMaterial.cpp
     src/fem/ANCFTetrahedralElement.cpp
+    src/fem/ANCFHexahedralElement.cpp
     src/fem/FlexibleBody.cpp
     src/fem/GmshReader.cpp
     src/fem/FlexibleContactDetector.cpp
     src/fem/FlexibleContactForce.cpp
     src/fem/FlexibleContactManager.cpp
     src/fem/FlexibleIntegrators.cpp
+    src/fem/MeshGenerators.cpp
 )
 
 add_library(multibody STATIC ${LIB_SOURCES})

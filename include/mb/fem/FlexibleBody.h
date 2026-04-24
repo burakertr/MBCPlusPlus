@@ -2,6 +2,7 @@
 #include "mb/core/Body.h"
 #include "mb/fem/ANCFTypes.h"
 #include "mb/fem/ANCFTetrahedralElement.h"
+#include "mb/fem/ANCFHexahedralElement.h"
 #include "mb/fem/ElasticMaterial.h"
 #include <vector>
 #include <memory>
@@ -20,6 +21,7 @@ class FlexibleBody : public Body {
 public:
     std::vector<ANCFNode> nodes;
     std::vector<ANCFTetrahedralElement> elements;
+    std::vector<ANCFHexahedralElement> hexElements;
     std::unique_ptr<MaterialModel> material;
     ElasticMaterialProps materialProps;
     int numDof = 0;
@@ -103,6 +105,7 @@ public:
     std::vector<Vec3> getNodePositions() const;
     std::vector<Vec3> getNodeDisplacements() const;
     std::vector<std::array<int,4>> getTetConnectivity() const;
+    std::vector<std::array<int,8>> getHexConnectivity() const;
 
     /// Compute von Mises stress at element centroid (Pa)
     double computeElementVonMises(int elemIdx) const;

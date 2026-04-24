@@ -12,6 +12,9 @@ constexpr int ANCF_NODE_DOF = 12;
 /// ANCF element DOF count: 4 nodes × 12 = 48
 constexpr int ANCF_ELEM_DOF = 48;
 
+/// ANCF hexahedral element DOF count: 8 nodes × 12 = 96
+constexpr int ANCF_HEX_ELEM_DOF = 96;
+
 /// ANCF node:
 ///   q[0..2]  = position (rx, ry, rz)
 ///   q[3..5]  = F column 0 (F11, F21, F31)
@@ -30,6 +33,11 @@ struct ANCFNode {
 /// Tetrahedral element connectivity (4 node indices)
 struct TetConnectivity {
     std::array<int, 4> nodeIds;
+};
+
+/// Hexahedral element connectivity (8 node indices)
+struct HexConnectivity {
+    std::array<int, 8> nodeIds;
 };
 
 /// Material type enumeration
@@ -73,7 +81,7 @@ struct GmshElement {
     std::vector<int> nodeIds;
 };
 
-/// Gmsh mesh (nodes + tet4 elements)
+/// Gmsh mesh (nodes + tet4/hex8 elements)
 struct GmshMesh {
     std::vector<GmshNode> nodes;
     std::vector<GmshElement> elements;

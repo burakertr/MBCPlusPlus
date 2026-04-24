@@ -35,6 +35,8 @@
 #include "mb/fem/FlexibleBody.h"
 #include "mb/fem/FlexibleIntegrators.h"
 #include "mb/core/ThreadConfig.h"
+#include "mb/fem/MeshGenerators.h"
+
 #include <cstdlib>
 
 using namespace mb;
@@ -45,9 +47,10 @@ using namespace mb;
 static constexpr double BEAM_Lx   = 1;     // length (m)
 static constexpr double BEAM_Ly   = 0.05;    // height (m)
 static constexpr double BEAM_Lz   = 0.05;    // depth  (m)
-static constexpr int    MESH_NX   = 50;
+static constexpr int    MESH_NX   =20;
 static constexpr int    MESH_NY   = 1;
 static constexpr int    MESH_NZ   = 1;
+static bool             USE_HEX_MESH = true;
 
 // Material (Neo-Hookean — stable under large deformation)
 // E=2e8 Pa gives ~23 cm static tip deflection (visible but no element inversion)
@@ -71,11 +74,13 @@ struct Simulation {
     // Cached rendering data
     std::vector<Vec3>               nodePos;
     std::vector<std::array<int,4>>  tetConn;
+    std::vector<std::array<int,8>>  hexConn;
     std::vector<double>             elemStrain; // per-element strain energy
 
     void build() {
-        auto mesh = generateBoxTetMesh(BEAM_Lx, BEAM_Ly, BEAM_Lz,
-                                       MESH_NX, MESH_NY, MESH_NZ);
+        auto mesh = USE_HEX_MESH
+            ? generateBoxHexMesh(BEAM_Lx, BEAM_Ly, BEAM_Lz, MESH_NX, MESH_NY, MESH_NZ)
+            : generateBoxTetMesh(BEAM_Lx, BEAM_Ly, BEAM_Lz, MESH_NX, MESH_NY, MESH_NZ);
 
         ElasticMaterialProps mat{MAT_E, MAT_NU, MAT_RHO, MaterialType::NeoHookean};
         body = FlexibleBody::fromMesh(mesh, mat, "Cantilever", true);
@@ -108,18 +113,30 @@ struct Simulation {
     void updateRenderData() {
         nodePos = body->getNodePositions();
         tetConn = body->getTetConnectivity();
+        hexConn = body->getHexConnectivity();
 
         // Per-element strain energy (for colouring)
-        int nElem = (int)body->elements.size();
+        int nElem = (int)body->elements.size() + (int)body->hexElements.size();
         elemStrain.resize(nElem);
         double maxSE = 0;
-        for (int e = 0; e < nElem; e++) {
+        int out = 0;
+        for (int e = 0; e < (int)body->elements.size(); e++) {
             auto& elem = body->elements[e];
             double F[9];
             elem.computeDeformationGradient(0.25, 0.25, 0.25, body->nodes, F);
             double se = body->material->strainEnergyDensity(F);
-            elemStrain[e] = se * elem.V0;
-            maxSE = std::max(maxSE, elemStrain[e]);
+            elemStrain[out] = se * elem.V0;
+            maxSE = std::max(maxSE, elemStrain[out]);
+            out++;
+        }
+        for (int e = 0; e < (int)body->hexElements.size(); e++) {
+            auto& elem = body->hexElements[e];
+            double F[9];
+            elem.computeDeformationGradient(0.0, 0.0, 0.0, body->nodes, F);
+            double se = body->material->strainEnergyDensity(F);
+            elemStrain[out] = se * elem.V0;
+            maxSE = std::max(maxSE, elemStrain[out]);
+            out++;
         }
         // Normalise
         if (maxSE > 1e-20)
@@ -261,11 +278,12 @@ protected:
         // ── Draw filled tetrahedra (projected to XY) ──
         auto& np = sim_.nodePos;
         auto& tc = sim_.tetConn;
+        auto& hc = sim_.hexConn;
         auto& se = sim_.elemStrain;
-        int nElem = (int)tc.size();
+        int nTet = (int)tc.size();
 
         // Each tet has 4 triangular faces; draw the 4 faces as filled triangles
-        for (int e = 0; e < nElem; e++) {
+        for (int e = 0; e < nTet; e++) {
             QColor col = heatmap(se[e]);
             col.setAlpha(180);
 
@@ -287,13 +305,29 @@ protected:
 
         // ── Draw edges ──
         p.setPen(QPen(QColor(200, 210, 230, 100), 0.8));
-        for (int e = 0; e < nElem; e++) {
+        for (int e = 0; e < nTet; e++) {
             int ids[4] = {tc[e][0], tc[e][1], tc[e][2], tc[e][3]};
             QPointF pts[4];
             for (int k = 0; k < 4; k++) pts[k] = toScreen(np[ids[k]]);
             for (int a = 0; a < 4; a++)
                 for (int b = a+1; b < 4; b++)
                     p.drawLine(pts[a], pts[b]);
+        }
+
+        // ── Draw hexahedra edges ──
+        if (!hc.empty()) {
+            p.setPen(QPen(QColor(230, 210, 120, 180), 1.0));
+            int edgePairs[12][2] = {
+                {0,1},{1,2},{2,3},{3,0},
+                {4,5},{5,6},{6,7},{7,4},
+                {0,4},{1,5},{2,6},{3,7}
+            };
+            for (int e = 0; e < (int)hc.size(); e++) {
+                QPointF pts[8];
+                for (int k = 0; k < 8; k++) pts[k] = toScreen(np[hc[e][k]]);
+                for (auto& edge : edgePairs)
+                    p.drawLine(pts[edge[0]], pts[edge[1]]);
+            }
         }
 
         // ── Draw nodes ──
@@ -453,8 +487,11 @@ private:
         line(QString(""));
         line(QString("DOFs: %1  (free %2)")
              .arg(sim_.body->numDof).arg(sim_.body->numFreeDof()));
-        line(QString("Nodes: %1  Tets: %2")
-             .arg(sim_.body->nodes.size()).arg(sim_.body->elements.size()));
+           line(QString("Nodes: %1  Tets: %2  Hex: %3")
+               .arg(sim_.body->nodes.size())
+               .arg(sim_.body->elements.size())
+               .arg(sim_.body->hexElements.size()));
+           line(QString("Mesh mode: %1").arg(USE_HEX_MESH ? "hex" : "tet"));
         line(QString(""));
         line(QString("Max disp: %1 mm").arg(sim_.lastResult.maxDisplacement * 1e3, 0, 'f', 2));
         line(QString("Strain E: %1 J").arg(sim_.lastResult.strainEnergy, 0, 'e', 3));
@@ -496,13 +533,15 @@ private:
 
 // ─────────────────────────────────────────────
 int main(int argc, char* argv[]) {
-    // Parse -c N for thread count, -r for recording
+    // Parse -c N for thread count, -r for recording, --hex for hexa mesh
     bool record = false;
     for (int i = 1; i < argc; i++) {
         if (std::string(argv[i]) == "-c" && i+1 < argc) {
             ThreadConfig::setNumThreads(std::atoi(argv[++i]));
         } else if (std::string(argv[i]) == "-r") {
             record = true;
+        } else if (std::string(argv[i]) == "--hex") {
+            USE_HEX_MESH = true;
         }
     }
 

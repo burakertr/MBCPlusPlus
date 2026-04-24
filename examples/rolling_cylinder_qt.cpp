@@ -43,6 +43,7 @@
 #include "mb/fem/FlexibleIntegrators.h"
 #include "mb/fem/FlexibleContactManager.h"
 #include "mb/core/ThreadConfig.h"
+#include "mb/fem/MeshGenerators.h"
 
 using namespace mb;
 
@@ -117,7 +118,7 @@ struct Sim {
 
         // ── Beam: pinned-pinned ──
         {
-            auto mesh = generateBoxTetMesh(BEAM_LX, BEAM_LY, BEAM_LZ,
+            auto mesh = mb::generateBoxTetMesh(BEAM_LX, BEAM_LY, BEAM_LZ,
                                            BEAM_NX, BEAM_NY, BEAM_NZ);
             // Center Z around 0, X starts at 0
             for (auto& n : mesh.nodes) {

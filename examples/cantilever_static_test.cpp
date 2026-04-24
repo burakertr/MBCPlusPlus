@@ -10,16 +10,72 @@
  */
 #include <cstdio>
 #include <cmath>
+#include <string>
 #include "mb/fem/ANCFTypes.h"
 #include "mb/fem/FlexibleBody.h"
 #include "mb/fem/FlexibleIntegrators.h"
+#include "mb/fem/MeshGenerators.h"
 
 using namespace mb;
+
+static void runCase(const char* meshName,
+                    const GmshMesh& mesh,
+                    double Lx,
+                    double Ly,
+                    double Lz,
+                    double E,
+                    double nu,
+                    double rho,
+                    double g,
+                    double delta_analytical)
+{
+    ElasticMaterialProps mat{E, nu, rho, MaterialType::NeoHookean};
+    auto body = FlexibleBody::fromMesh(mesh, mat, "beam", true);
+    body->gravity = Vec3(0, -g, 0);
+    body->dampingAlpha = 0;
+    body->fixNodesOnPlane('x', 0.0, 1e-6);
+
+    std::printf("  [%s] nodes=%zu, elems(tet=%zu hex=%zu), free_DOFs=%d\n",
+                meshName,
+                body->nodes.size(),
+                body->elements.size(),
+                body->hexElements.size(),
+                body->numFreeDof());
+
+    auto Qg = body->computeGravityForces();
+    double totalGravForce = 0;
+    for (int i = 0; i < (int)body->nodes.size(); i++) {
+        int off = i * 12;
+        totalGravForce += Qg[off + 1];
+    }
+    std::printf("    Gravity force (Y): %.3f N (expected: %.3f N)\n",
+                totalGravForce, -rho * Lx * Ly * Lz * g);
+
+    StaticSolveOptions opts;
+    opts.maxIter = 50;
+    opts.tol = 1e-4;
+    opts.verbose = false;
+    opts.nLoadSteps = 1;
+
+    auto result = solveStaticEquilibrium(*body, opts);
+
+    double maxDeflY = 0;
+    for (const auto &nd : body->nodes) {
+        if (std::abs(nd.X0[0] - Lx) < 1e-6) {
+            double dy = -(nd.q[1] - nd.X0[1]);
+            if (dy > maxDeflY) maxDeflY = dy;
+        }
+    }
+
+    std::printf("    converged=%s iters=%d tip_defl=%.6f mm ratio=%.4f\n",
+                result.converged ? "YES" : "NO", result.iterations,
+                maxDeflY * 1e3, maxDeflY / delta_analytical);
+}
 
 int main()
 {
     double Lx = 1.0, Ly = 0.05, Lz = 0.05;
-    double E = 70e9, nu = 0.3, rho = 7800.0;
+    double E = 70e8, nu = 0.3, rho = 7800.0;
     double g = 9.81;
 
     double A = Ly * Lz;
@@ -39,57 +95,19 @@ int main()
     {
         int nx, ny, nz;
     };
-    MeshConfig meshes[] = {{5, 1, 1}, {10, 1, 1}, {10, 2, 2}, {20, 2, 2}, {20, 4, 4}};
+    MeshConfig meshes[] = {{5, 1, 1}, {10, 1, 1}, {10, 2, 2}, {20, 2, 2}, {60, 1, 1}};
 
     for (auto &mc : meshes)
     {
         int nx = mc.nx, ny = mc.ny, nz = mc.nz;
-        auto mesh = generateBoxTetMesh(Lx, Ly, Lz, nx, ny, nz);
+        std::printf("Mesh %dx%dx%d\n", nx, ny, nz);
 
-        ElasticMaterialProps mat{E, nu, rho, MaterialType::NeoHookean};
-        auto body = FlexibleBody::fromMesh(mesh, mat, "beam", true);
-        body->gravity = Vec3(0, -g, 0);
-        body->dampingAlpha = 0;
-        body->fixNodesOnPlane('x', 0.0, 1e-6);
+  
 
-        std::printf("Mesh %dx%dx%d: nodes=%zu, elems=%zu, free_pos_DOFs=%d\n",
-                    nx, ny, nz, body->nodes.size(), body->elements.size(),
-                    body->numFreeDof());
+        auto hexMesh = generateBoxHexMesh(Lx, Ly, Lz, nx, ny, nz);
+        runCase("hex", hexMesh, Lx, Ly, Lz, E, nu, rho, g, delta_analytical);
 
-        // Check gravity
-        auto Qg = body->computeGravityForces();
-        double totalGravForce = 0;
-        for (int i = 0; i < (int)body->nodes.size(); i++)
-        {
-            int off = i * 12;
-            totalGravForce += Qg[off + 1];
-        }
-        std::printf("  Gravity force (Y): %.3f N (expected: %.3f N)\n",
-                    totalGravForce, -rho * Lx * Ly * Lz * g);
-
-        // Static solve
-        StaticSolveOptions opts;
-        opts.maxIter = 50;
-        opts.tol = 1e-4;
-        opts.verbose = false;
-        opts.nLoadSteps = 1;
-
-        auto result = solveStaticEquilibrium(*body, opts);
-
-        double maxDeflY = 0;
-        for (const auto &nd : body->nodes)
-        {
-            if (std::abs(nd.X0[0] - Lx) < 1e-6)
-            {
-                double dy = -(nd.q[1] - nd.X0[1]);
-                if (dy > maxDeflY)
-                    maxDeflY = dy;
-            }
-        }
-
-        std::printf("  converged=%s iters=%d  tip_defl=%.6f mm  ratio=%.4f\n\n",
-                    result.converged ? "YES" : "NO", result.iterations,
-                    maxDeflY * 1e3, maxDeflY / delta_analytical);
+        std::printf("\n");
     }
 
     return 0;

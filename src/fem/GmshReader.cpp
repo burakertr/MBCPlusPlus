@@ -72,7 +72,7 @@ GmshMesh GmshReader::parseV2(const std::vector<std::string>& lines) {
         int nid;
         while (ss >> nid) nodeIds.push_back(nid);
 
-        if (elType == 4) {
+        if (elType == 4 || elType == 5) {
             mesh.elements.push_back({elId, elType, nodeIds});
         }
     }
@@ -137,7 +137,7 @@ GmshMesh GmshReader::parseV4(const std::vector<std::string>& lines) {
             int nid;
             while (ess >> nid) nodeIds.push_back(nid);
 
-            if (elType == 4) {
+            if (elType == 4 || elType == 5) {
                 mesh.elements.push_back({elId, elType, nodeIds});
             }
             i++;
