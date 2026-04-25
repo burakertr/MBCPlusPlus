@@ -47,7 +47,7 @@ using namespace mb;
 static constexpr double BEAM_Lx   = 1;     // length (m)
 static constexpr double BEAM_Ly   = 0.05;    // height (m)
 static constexpr double BEAM_Lz   = 1;    // depth  (m)
-static constexpr int    MESH_NX   =20;
+static constexpr int    MESH_NX   =5;
 static constexpr int    MESH_NY   = 1;
 static constexpr int    MESH_NZ   = 1;
 static bool             USE_HEX_MESH = true;
@@ -57,7 +57,7 @@ static bool             USE_HHT_SOLVER = false;
 // E=2e8 Pa gives ~23 cm static tip deflection (visible but no element inversion)
 static constexpr double MAT_E     = 70e9;     // Pa
 static constexpr double MAT_NU    = 0.3;
-static constexpr double MAT_RHO   = 780000.0;   // kg/m³
+static constexpr double MAT_RHO   = 7800.0;   // kg/m³
 
 // ─────────────────────────────────────────────
 //  Simulation state
