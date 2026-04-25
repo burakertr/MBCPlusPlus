@@ -41,7 +41,7 @@
 using namespace mb;
 static constexpr double DT          = 0.005;   // adım [s]
 static constexpr double T_END       = 30.0;    // simülasyon süresi [s]
-static constexpr double HHT_ALPHA   =  -0.02;   // daha düşük sayısal sönüm
+static constexpr double HHT_ALPHA   =  -0.3;   // daha düşük sayısal sönüm
 static constexpr double HHT_RELTOL  = 1e-4;   // Newton göreli tolerans
 static constexpr double HHT_ABSTOL  = 1e-6;   // Newton mutlak tolerans
 // ─────────────────────────────────────────────

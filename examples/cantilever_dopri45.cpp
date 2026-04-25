@@ -54,7 +54,7 @@ static constexpr int    MESH_NZ   = 1;
 static bool             USE_HEX_MESH = true;
 
 // Material (Neo-Hookean)
-static constexpr double MAT_E     = 70e9;     // Pa
+static constexpr double MAT_E     = 70e6;     // Pa
 static constexpr double MAT_NU    = 0.3;
 static constexpr double MAT_RHO   = 7800.0;   // kg/m³
 
@@ -89,7 +89,7 @@ struct Simulation {
         body = FlexibleBody::fromMesh(mesh, mat, "Cantilever", true);
 
         body->gravity = Vec3(0, -9.81, 0);
-        body->dampingAlpha = 0.0;   // no physical damping — pure energy conservation
+        body->dampingAlpha = 0;   // no physical damping — pure energy conservation
 
         // Fix the left face (x ≈ 0)
         body->fixNodesOnPlane('x', 0.0, 1e-6);

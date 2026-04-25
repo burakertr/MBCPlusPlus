@@ -26,10 +26,12 @@
 
 #include "mb/core/RigidBody.h"
 #include "mb/constraints/RevoluteJoint.h"
-#include "mb/solvers/DirectSolver.h"
+#include "mb/solvers/NewtonRaphson.h"
 #include "mb/integrators/RungeKutta.h"
 #include "mb/system/MultibodySystem.h"
 #include "mb/core/ThreadConfig.h"
+#include "mb/integrators/BDF.h"
+
 #include <cstdlib>
 
 using namespace mb;
@@ -41,7 +43,11 @@ static constexpr int N_LINKS = 20;
 static constexpr double LINK_LENGTH = 0.5;   // metres per link
 static constexpr double LINK_MASS   = 0.2;   // kg per link
 static constexpr double LINK_RADIUS = 0.05;  // visual rod radius
-
+static constexpr double DT          = 0.005;   // adım [s]
+static constexpr double T_END       = 30.0;    // simülasyon süresi [s]
+static constexpr double HHT_ALPHA   =  -0.3;   // daha düşük sayısal sönüm
+static constexpr double HHT_RELTOL  = 1e-4;   // Newton göreli tolerans
+static constexpr double HHT_ABSTOL  = 1e-6;   // Newton mutlak tolerans
 // ─────────────────────────────────────────────
 //  Nice rainbow palette
 // ─────────────────────────────────────────────
@@ -61,9 +67,9 @@ struct Simulation {
     std::vector<std::shared_ptr<RigidBody>> links;
     std::vector<std::shared_ptr<RevoluteJoint>> joints;
 
-    double dt       = 0.0005;
+    double dt       = 0.002;
     int    subSteps = 20;     // 20 × 0.5 ms = 10 ms / frame
-    double damping  = 0.05;   // Nm·s/rad — joint damping coefficient
+    double damping  = 0;   // Nm·s/rad — joint damping coefficient
 
     // Cached world positions: jointPos[i] = joint between link i-1 and link i
     // jointPos[0] = pivot (ground attachment)
@@ -126,14 +132,18 @@ struct Simulation {
         }
 
         // Integrator: DOPRI45 adaptive
-        sys.setSolver(std::make_shared<DirectSolver>());
-        IntegratorConfig cfg;
+       
+        SolverConfig solverCfg;
+        solverCfg.maxIterations = 25;
+        solverCfg.tolerance = 1e-10;
+        solverCfg.warmStart = true;
+        sys.setSolver(std::make_shared<NewtonRaphsonSolver>(solverCfg));
+        mb::IntegratorConfig cfg;
         cfg.adaptive = true;
-        cfg.absTol   = 1e-6;
-        cfg.relTol   = 1e-4;
-        cfg.maxStep  = 0.02;
-        cfg.minStep  = 1e-3;
-        sys.setIntegrator(std::make_shared<DormandPrince45>(cfg));
+        cfg.relTol   = HHT_RELTOL;
+        cfg.absTol   = HHT_ABSTOL;
+        
+        sys.setIntegrator(std::make_shared<HHTAlpha>(HHT_ALPHA, 10, HHT_ABSTOL, cfg));
 
         sys.initialize();
         updatePositions();

@@ -57,7 +57,7 @@ static bool             USE_HHT_SOLVER = false;
 // E=2e8 Pa gives ~23 cm static tip deflection (visible but no element inversion)
 static constexpr double MAT_E     = 70e9;     // Pa
 static constexpr double MAT_NU    = 0.3;
-static constexpr double MAT_RHO   = 7800.0;   // kg/m³
+static constexpr double MAT_RHO   = 780000.0;   // kg/m³
 
 // ─────────────────────────────────────────────
 //  Simulation state

@@ -75,7 +75,7 @@ static void runCase(const char* meshName,
 int main()
 {
     double Lx = 1.0, Ly = 0.05, Lz = 0.05;
-    double E = 70e8, nu = 0.3, rho = 7800.0;
+    double E = 70e9, nu = 0.3, rho = 7800.0;
     double g = 9.81;
 
     double A = Ly * Lz;
@@ -95,7 +95,7 @@ int main()
     {
         int nx, ny, nz;
     };
-    MeshConfig meshes[] = {{5, 1, 1}, {10, 1, 1}, {10, 2, 2}, {20, 2, 2}, {60, 1, 1}};
+    MeshConfig meshes[] = {{5, 1, 1}, {100, 1, 1}};
 
     for (auto &mc : meshes)
     {

@@ -68,7 +68,7 @@
 #include "mb/constraints/SphericalJoint.h"
 #include "mb/constraints/PrismaticJoint.h"
 #include "mb/forces/AppliedForce.h"
-#include "mb/solvers/DirectSolver.h"
+#include "mb/solvers/NewtonRaphson.h"
 #include "mb/integrators/RungeKutta.h"
 #include "mb/integrators/BDF.h"
 #include "mb/system/MultibodySystem.h"
@@ -399,7 +399,12 @@ struct Simulation {
             Vec3(gdX,0,0), Vec3(0,0,0),
             Vec3(1,0,0), Vec3(1,0,0), 0.0, "J_Driven"));
 
-        sys.setSolver(std::make_shared<DirectSolver>());
+                SolverConfig solverCfg;
+        solverCfg.maxIterations = 25;
+        solverCfg.tolerance = 1e-10;
+        solverCfg.warmStart = true;
+        sys.setSolver(std::make_shared<NewtonRaphsonSolver>(solverCfg));
+
         // HHT-α: α=-0.05 → hafif yüksek-frekans sönümlemesi, 2. derece doğru
         // γ=0.55, β=0.2756 (otomatik hesaplanır), koşulsuz kararlı
         IntegratorConfig cfg;
