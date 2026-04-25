@@ -144,11 +144,17 @@ public:
 
     FlexStepResult step(double dt);
 
+    int lastNewtonIters() const { return lastIters_; }
+    double lastResidualNorm() const { return lastResNorm_; }
+    int totalSteps() const { return stepCount_; }
+
 private:
     FlexibleBody& body_;
     std::vector<double> aPrev_;
     std::vector<double> MInvDiag_;
     int stepCount_ = 0;
+    int lastIters_ = 0;
+    double lastResNorm_ = 0.0;
 
     const std::vector<double>& ensureMassInverse();
     std::vector<int> getFreeDofMap() const;

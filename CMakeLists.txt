@@ -106,6 +106,9 @@ if(Qt5_FOUND)
     add_executable(cantilever_qt examples/cantilever_qt.cpp)
     target_link_libraries(cantilever_qt PRIVATE multibody Qt5::Widgets)
 
+    add_executable(cantilever_dopri45 examples/cantilever_dopri45.cpp)
+    target_link_libraries(cantilever_dopri45 PRIVATE multibody Qt5::Widgets)
+
     add_executable(spinning_beam_qt examples/spinning_beam_qt.cpp)
     target_link_libraries(spinning_beam_qt PRIVATE multibody Qt5::Widgets)
 

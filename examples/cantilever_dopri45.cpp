@@ -1,9 +1,9 @@
 /**
- * ANCF Cantilever Beam — Flexible multibody dynamics demo with Qt.
+ * ANCF Cantilever Beam — DOPRI45 Adaptive Integrator Demo
  *
  * A steel beam (1 m × 0.05 m × 0.05 m) is clamped at x = 0 and
- * falls under gravity.  Uses the Dormand-Prince 4(5) adaptive
- * integrator for accurate, stable time integration.
+ * falls under gravity. Uses the Dormand-Prince 4(5) adaptive integrator
+ * for accurate time integration with strict energy conservation.
  *
  * Colour encodes strain energy density at each element.
  *
@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <memory>
 #include <iostream>
+#include <cstring>
 
 #include "mb/fem/ANCFTypes.h"
 #include "mb/fem/FlexibleBody.h"
@@ -46,15 +47,13 @@ using namespace mb;
 // ─────────────────────────────────────────────
 static constexpr double BEAM_Lx   = 1;     // length (m)
 static constexpr double BEAM_Ly   = 0.05;    // height (m)
-static constexpr double BEAM_Lz   = 1;    // depth  (m)
-static constexpr int    MESH_NX   =20;
+static constexpr double BEAM_Lz   = 0.05;    // depth  (m)
+static constexpr int    MESH_NX   = 10;
 static constexpr int    MESH_NY   = 1;
 static constexpr int    MESH_NZ   = 1;
 static bool             USE_HEX_MESH = true;
-static bool             USE_HHT_SOLVER = false;
 
-// Material (Neo-Hookean — stable under large deformation)
-// E=2e8 Pa gives ~23 cm static tip deflection (visible but no element inversion)
+// Material (Neo-Hookean)
 static constexpr double MAT_E     = 70e9;     // Pa
 static constexpr double MAT_NU    = 0.3;
 static constexpr double MAT_RHO   = 7800.0;   // kg/m³
@@ -64,19 +63,22 @@ static constexpr double MAT_RHO   = 7800.0;   // kg/m³
 // ─────────────────────────────────────────────
 struct Simulation {
     std::shared_ptr<FlexibleBody> body;
-    std::unique_ptr<FlexHHTIntegrator> hht;
-    std::unique_ptr<ImplicitFlexIntegrator> implicitInt;
+    std::unique_ptr<FlexDOPRI45> dopri;
 
-    double dtFrame   = 0.005;     // 1 ms per frame (smaller for stability with full ANCF)
+    double dtFrame   = 0.01;      // target 10 ms per frame (adaptive may take smaller steps)
     double time      = 0;
+    double timeE0    = 0;         // energy reference time
 
     FlexStepResult lastResult{};
+    double E0        = 0;         // initial total energy
+    int stepsTaken   = 0;
+    int stepsRejected = 0;
 
     // Cached rendering data
     std::vector<Vec3>               nodePos;
     std::vector<std::array<int,4>>  tetConn;
     std::vector<std::array<int,8>>  hexConn;
-    std::vector<double>             elemStrain; // per-element strain energy
+    std::vector<double>             elemStrain;
 
     void build() {
         auto mesh = USE_HEX_MESH
@@ -87,35 +89,37 @@ struct Simulation {
         body = FlexibleBody::fromMesh(mesh, mat, "Cantilever", true);
 
         body->gravity = Vec3(0, -9.81, 0);
-        body->dampingAlpha = USE_HHT_SOLVER ? 20.0 : 0.0;
+        body->dampingAlpha = 0.0;   // no physical damping — pure energy conservation
 
         // Fix the left face (x ≈ 0)
         body->fixNodesOnPlane('x', 0.0, 1e-6);
 
-        if (USE_HHT_SOLVER) {
-            hht = std::make_unique<FlexHHTIntegrator>(*body);
-            hht->alpha = -0.3;           // strong numerical damping for stability
-            hht->newtonTol = 1e-3;
-            hht->maxNewtonIter = 5;
-            hht->useAnalyticStiffness = true;   // analytic stiffness with penalty
-            hht->verbose = false;
-            implicitInt.reset();
-        } else {
-            implicitInt = std::make_unique<ImplicitFlexIntegrator>(*body);
-            implicitInt->hhtAlpha = 0.0;
-            implicitInt->newtonTol = 1e-6;
-            implicitInt->maxNewtonIter = 20;
-            implicitInt->fdEps = 1e-6;
-            hht.reset();
-        }
+        dopri = std::make_unique<FlexDOPRI45>(*body);
+        dopri->absTol  = 1e-6;
+        dopri->relTol  = 1e-4;
+        dopri->maxStep = 0.01;
+        dopri->minStep = 1e-8;
+        dopri->dtCurrent = 1e-4;
 
         time = 0;
+        timeE0 = 0;
+        stepsTaken = 0;
+        stepsRejected = 0;
+        E0 = 0;
         updateRenderData();
+
+        // Measure initial energy
+        double SE = body->computeStrainEnergy();
+        double KE = body->computeKineticEnergy();
+        double PE = body->computePotentialEnergy(body->gravity);
+        E0 = SE + KE + PE - SE;  // PE - SE (gravitational PE only)
     }
 
     void step() {
-        lastResult = USE_HHT_SOLVER ? hht->step(dtFrame) : implicitInt->step(dtFrame);
+        lastResult = dopri->step(dtFrame);
         time += dtFrame;
+        stepsTaken = dopri->totalSteps;
+        stepsRejected = dopri->totalRejects;
         updateRenderData();
     }
 
@@ -147,7 +151,6 @@ struct Simulation {
             maxSE = std::max(maxSE, elemStrain[out]);
             out++;
         }
-        // Normalise
         if (maxSE > 1e-20)
             for (auto& v : elemStrain) v /= maxSE;
     }
@@ -158,7 +161,6 @@ struct Simulation {
 // ─────────────────────────────────────────────
 static QColor heatmap(double t) {
     t = std::clamp(t, 0.0, 1.0);
-    // 5-segment piecewise
     double r, g, b;
     if (t < 0.25) {
         double s = t / 0.25;
@@ -179,11 +181,11 @@ static QColor heatmap(double t) {
 // ─────────────────────────────────────────────
 //  Qt Widget
 // ─────────────────────────────────────────────
-class CantileverWidget : public QWidget {
+class CantileverDOPRI45Widget : public QWidget {
 public:
-    CantileverWidget(bool record = false, QWidget* parent = nullptr)
+    CantileverDOPRI45Widget(bool record = false, QWidget* parent = nullptr)
         : QWidget(parent), recording_(record) {
-        setWindowTitle("MBC++ — ANCF Cantilever Beam");
+        setWindowTitle("MBC++ — ANCF Cantilever DOPRI45");
         resize(1200, 700);
         setMinimumSize(900, 500);
 
@@ -198,21 +200,21 @@ public:
                  << "-i" << "pipe:0"
                  << "-c:v" << "libx264" << "-preset" << "fast"
                  << "-crf" << "18" << "-pix_fmt" << "yuv420p"
-                 << "cantilever_sim.mp4";
+                 << "cantilever_dopri45.mp4";
             ffmpeg_->start("ffmpeg", args);
             ffmpeg_->waitForStarted();
-            printf("[REC] Recording to cantilever_sim.mp4 (%dx%d @60fps)\n", width(), height());
+            printf("[REC] Recording to cantilever_dopri45.mp4 (%dx%d @60fps)\n", width(), height());
         }
 
         timer_ = new QTimer(this);
-        connect(timer_, &QTimer::timeout, this, &CantileverWidget::tick);
+        connect(timer_, &QTimer::timeout, this, &CantileverDOPRI45Widget::tick);
         timer_->start(16);
 
         elapsed_.start();
         setFocusPolicy(Qt::StrongFocus);
     }
 
-    ~CantileverWidget() override {
+    ~CantileverDOPRI45Widget() override {
         stopRecording();
     }
 
@@ -233,7 +235,6 @@ protected:
         double cElev = std::cos(elevation_), sElev = std::sin(elevation_);
 
         auto toScreen = [&](const Vec3& v) -> QPointF {
-            // rotate around Y (azimuth), then around X (elevation)
             double x1 =  v.x * ca + v.z * sa;
             double y1 =  v.y;
             double z1 = -v.x * sa + v.z * ca;
@@ -267,216 +268,59 @@ protected:
             };
             drawAxis(Vec3(0.15, 0, 0), QColor(220, 70, 70),  "X");
             drawAxis(Vec3(0, 0.15, 0), QColor(70, 200, 70),  "Y");
-            drawAxis(Vec3(0, 0, 0.15), QColor(70, 130, 255), "Z");
+            drawAxis(Vec3(0, 0, 0.15), QColor(70, 120, 200), "Z");
         }
 
-        // ── Wall (clamp) ──
-        {
-            QPointF top  = toScreen(Vec3(0,  BEAM_Ly * 3, 0));
-            QPointF bot  = toScreen(Vec3(0, -BEAM_Ly * 3, 0));
-            p.setPen(QPen(QColor(160, 160, 160), 2));
-            p.drawLine(top, bot);
-            for (int i = -4; i <= 4; i++) {
-                double yy = i * BEAM_Ly * 0.75;
-                QPointF a = toScreen(Vec3(0, yy, 0));
-                QPointF b = toScreen(Vec3(-BEAM_Lx * 0.03, yy - BEAM_Ly * 0.6, 0));
-                p.drawLine(a, b);
+        // ── Render tetrahedral elements ──
+        if (!USE_HEX_MESH) {
+            for (const auto& conn : sim_.tetConn) {
+                std::array<QPointF, 4> pts{
+                    toScreen(sim_.nodePos[conn[0]]),
+                    toScreen(sim_.nodePos[conn[1]]),
+                    toScreen(sim_.nodePos[conn[2]]),
+                    toScreen(sim_.nodePos[conn[3]])
+                };
+                for (int i = 0; i < 4; i++) {
+                    for (int j = i+1; j < 4; j++) {
+                        int elemIdx = (int)(&conn - sim_.tetConn.data());
+                        QColor c = heatmap(sim_.elemStrain[elemIdx]);
+                        p.setPen(QPen(c, 1.5));
+                        p.drawLine(pts[i], pts[j]);
+                    }
+                }
             }
         }
 
-        // ── Draw filled tetrahedra (projected to XY) ──
-        auto& np = sim_.nodePos;
-        auto& tc = sim_.tetConn;
-        auto& hc = sim_.hexConn;
-        auto& se = sim_.elemStrain;
-        int nTet = (int)tc.size();
+        // ── Render hexahedral elements ──
+        if (USE_HEX_MESH) {
+            for (const auto& conn : sim_.hexConn) {
+                std::array<QPointF, 8> pts{
+                    toScreen(sim_.nodePos[conn[0]]),
+                    toScreen(sim_.nodePos[conn[1]]),
+                    toScreen(sim_.nodePos[conn[2]]),
+                    toScreen(sim_.nodePos[conn[3]]),
+                    toScreen(sim_.nodePos[conn[4]]),
+                    toScreen(sim_.nodePos[conn[5]]),
+                    toScreen(sim_.nodePos[conn[6]]),
+                    toScreen(sim_.nodePos[conn[7]])
+                };
+                // Hex wireframe: bottom face (0,1,2,3), top (4,5,6,7), verticals
+                int elemIdx = (int)(&conn - sim_.hexConn.data());
+                QColor c = heatmap(sim_.elemStrain[sim_.tetConn.size() + elemIdx]);
+                p.setPen(QPen(c, 1.5));
 
-        // Each tet has 4 triangular faces; draw the 4 faces as filled triangles
-        for (int e = 0; e < nTet; e++) {
-            QColor col = heatmap(se[e]);
-            col.setAlpha(180);
-
-            int n0 = tc[e][0], n1 = tc[e][1], n2 = tc[e][2], n3 = tc[e][3];
-            QPointF pts[4] = {toScreen(np[n0]), toScreen(np[n1]),
-                              toScreen(np[n2]), toScreen(np[n3])};
-
-            // Draw 4 faces of tetrahedron
-            int faces[4][3] = {{0,1,2},{0,1,3},{0,2,3},{1,2,3}};
-            for (auto& f : faces) {
-                QPainterPath path;
-                path.moveTo(pts[f[0]]);
-                path.lineTo(pts[f[1]]);
-                path.lineTo(pts[f[2]]);
-                path.closeSubpath();
-                p.fillPath(path, col);
+                // Bottom quad
+                p.drawLine(pts[0], pts[1]); p.drawLine(pts[1], pts[2]);
+                p.drawLine(pts[2], pts[3]); p.drawLine(pts[3], pts[0]);
+                // Top quad
+                p.drawLine(pts[4], pts[5]); p.drawLine(pts[5], pts[6]);
+                p.drawLine(pts[6], pts[7]); p.drawLine(pts[7], pts[4]);
+                // Verticals
+                for (int i = 0; i < 4; i++) p.drawLine(pts[i], pts[i+4]);
             }
         }
-
-        // ── Draw edges ──
-        p.setPen(QPen(QColor(200, 210, 230, 100), 0.8));
-        for (int e = 0; e < nTet; e++) {
-            int ids[4] = {tc[e][0], tc[e][1], tc[e][2], tc[e][3]};
-            QPointF pts[4];
-            for (int k = 0; k < 4; k++) pts[k] = toScreen(np[ids[k]]);
-            for (int a = 0; a < 4; a++)
-                for (int b = a+1; b < 4; b++)
-                    p.drawLine(pts[a], pts[b]);
-        }
-
-        // ── Draw hexahedra edges ──
-        if (!hc.empty()) {
-            p.setPen(QPen(QColor(230, 210, 120, 180), 1.0));
-            int edgePairs[12][2] = {
-                {0,1},{1,2},{2,3},{3,0},
-                {4,5},{5,6},{6,7},{7,4},
-                {0,4},{1,5},{2,6},{3,7}
-            };
-            for (int e = 0; e < (int)hc.size(); e++) {
-                QPointF pts[8];
-                for (int k = 0; k < 8; k++) pts[k] = toScreen(np[hc[e][k]]);
-                for (auto& edge : edgePairs)
-                    p.drawLine(pts[edge[0]], pts[edge[1]]);
-            }
-        }
-
-        // ── Draw nodes ──
-        for (size_t i = 0; i < np.size(); i++) {
-            QPointF pt = toScreen(np[i]);
-            bool fixed = sim_.body->nodes[i].fixed;
-            if (fixed) {
-                p.setPen(Qt::NoPen);
-                p.setBrush(QColor(255, 80, 80, 200));
-                p.drawEllipse(pt, 4, 4);
-            } else {
-                p.setPen(Qt::NoPen);
-                p.setBrush(QColor(200, 220, 255, 160));
-                p.drawEllipse(pt, 2.5, 2.5);
-            }
-        }
-
-        // ── Colour bar ──
-        drawColourBar(p, w, h);
 
         // ── HUD ──
-        drawHUD(p, w, h);
-    }
-
-    void keyPressEvent(QKeyEvent* e) override {
-        switch (e->key()) {
-        case Qt::Key_Space:
-            paused_ = !paused_;
-            break;
-        case Qt::Key_R:
-            sim_.build();
-            elapsed_.restart();
-            frameCount_ = 0;
-            azimuth_ = elevation_ = panX_ = panY_ = 0;
-            zoom_ = 1.0;
-            break;
-        case Qt::Key_Plus: case Qt::Key_Equal:
-            zoom_ *= 1.2;
-            break;
-        case Qt::Key_Minus:
-            zoom_ /= 1.2;
-            break;
-        case Qt::Key_Escape:
-            stopRecording();
-            close();
-            break;
-        }
-    }
-
-    void mousePressEvent(QMouseEvent* e) override {
-        lastMousePos_ = e->pos();
-        e->accept();
-    }
-
-    void mouseMoveEvent(QMouseEvent* e) override {
-        QPoint d = e->pos() - lastMousePos_;
-        lastMousePos_ = e->pos();
-        if (e->buttons() & Qt::LeftButton) {
-            azimuth_   -= d.x() * 0.005;
-            elevation_ -= d.y() * 0.005;
-            elevation_  = std::clamp(elevation_, -1.5, 1.5);
-        }
-        if (e->buttons() & (Qt::RightButton | Qt::MiddleButton)) {
-            panX_ += d.x();
-            panY_ += d.y();
-        }
-        update();
-        e->accept();
-    }
-
-    void wheelEvent(QWheelEvent* e) override {
-        double f = (e->angleDelta().y() > 0) ? 1.15 : 1.0 / 1.15;
-        zoom_ *= f;
-        update();
-        e->accept();
-    }
-
-private slots:
-    void tick() {
-        if (!paused_) sim_.step();
-        frameCount_++;
-        update();
-
-        if (recording_ && ffmpeg_ && ffmpeg_->state() == QProcess::Running) {
-            QImage img(size(), QImage::Format_ARGB32);
-            img.fill(Qt::black);
-            render(&img);
-            ffmpeg_->write((const char*)img.constBits(), img.sizeInBytes());
-        }
-    }
-
-private:
-    Simulation sim_;
-    QTimer* timer_ = nullptr;
-    QElapsedTimer elapsed_;
-    bool paused_    = false;
-    int  frameCount_ = 0;
-    bool recording_  = false;
-    QProcess* ffmpeg_ = nullptr;
-    double zoom_      = 1.0;
-    double azimuth_   = 0.0;   // orbit around Y (rad)
-    double elevation_ = 0.0;   // orbit around X (rad)
-    double panX_      = 0.0;   // pan offset (px)
-    double panY_      = 0.0;
-    QPoint lastMousePos_;
-
-    void stopRecording() {
-        if (ffmpeg_ && ffmpeg_->state() == QProcess::Running) {
-            ffmpeg_->closeWriteChannel();
-            ffmpeg_->waitForFinished(5000);
-            printf("[REC] Saved cantilever_sim.mp4\n");
-            ffmpeg_ = nullptr;
-        }
-    }
-
-    void drawColourBar(QPainter& p, int w, int h) {
-        int bx = w - 45, by = h/2 - 100, bw = 18, bh = 200;
-        for (int i = 0; i < bh; i++) {
-            double t = 1.0 - double(i) / bh;
-            p.setPen(heatmap(t));
-            p.drawLine(bx, by + i, bx + bw, by + i);
-        }
-        p.setPen(QColor(140, 140, 160));
-        p.drawRect(bx - 1, by - 1, bw + 2, bh + 2);
-
-        QFont f("Sans", 8);
-        p.setFont(f);
-        p.drawText(bx - 10, by - 8,  "high");
-        p.drawText(bx - 8,  by + bh + 14, "low");
-        // Vertical label
-        p.save();
-        p.translate(bx + bw + 16, by + bh/2);
-        p.rotate(-90);
-        p.drawText(0, 0, "Strain Energy");
-        p.restore();
-    }
-
-    void drawHUD(QPainter& p, int w, int /*h*/) {
-        double fps = frameCount_ / (elapsed_.elapsed() * 0.001 + 1e-9);
-
         p.setPen(QColor(200, 200, 200));
         QFont f("Monospace", 11);
         f.setStyleHint(QFont::Monospace);
@@ -488,25 +332,22 @@ private:
             y += dy;
         };
 
+        double fps = 0;
+        if (frameTime_ > 1e-9) fps = 1.0 / frameTime_;
+
         line(QString("t = %1 s").arg(sim_.time, 0, 'f', 4));
         line(QString("FPS  %1").arg(fps, 0, 'f', 1));
-        if (USE_HHT_SOLVER) {
-            line(QString("Integrator: HHT-α (α=%1)").arg(sim_.hht->alpha, 0, 'f', 2));
-            line(QString("Newton iters: %1  |R|=%2").arg(sim_.hht->lastNewtonIters()).arg(sim_.hht->lastResidualNorm(), 0, 'e', 2));
-            line(QString("Total steps: %1").arg(sim_.hht->totalSteps()));
-        } else {
-            line(QString("Integrator: Implicit Newmark (α=%1)").arg(sim_.implicitInt->hhtAlpha, 0, 'f', 2));
-            line(QString("Newton iters: %1  |R|=%2").arg(sim_.implicitInt->lastNewtonIters()).arg(sim_.implicitInt->lastResidualNorm(), 0, 'e', 2));
-            line(QString("Total steps: %1").arg(sim_.implicitInt->totalSteps()));
-        }
+        line(QString("Integrator: DOPRI45 (adaptive)"));
+        line(QString("Steps: %1  Rejects: %2").arg(sim_.stepsTaken).arg(sim_.stepsRejected));
+        line(QString("h_curr: %1 s").arg(sim_.dopri->dtCurrent, 0, 'e', 2));
         line(QString(""));
         line(QString("DOFs: %1  (free %2)")
              .arg(sim_.body->numDof).arg(sim_.body->numFreeDof()));
-           line(QString("Nodes: %1  Tets: %2  Hex: %3")
-               .arg(sim_.body->nodes.size())
-               .arg(sim_.body->elements.size())
-               .arg(sim_.body->hexElements.size()));
-           line(QString("Mesh mode: %1").arg(USE_HEX_MESH ? "hex" : "tet"));
+        line(QString("Nodes: %1  Tets: %2  Hex: %3")
+             .arg(sim_.body->nodes.size())
+             .arg(sim_.body->elements.size())
+             .arg(sim_.body->hexElements.size()));
+        line(QString("Mesh mode: %1").arg(USE_HEX_MESH ? "hex" : "tet"));
         line(QString(""));
         line(QString("Max disp: %1 mm").arg(sim_.lastResult.maxDisplacement * 1e3, 0, 'f', 2));
         line(QString("Strain E: %1 J").arg(sim_.lastResult.strainEnergy, 0, 'e', 3));
@@ -515,6 +356,12 @@ private:
         double totalE = sim_.lastResult.strainEnergy + sim_.lastResult.kineticEnergy
                       + sim_.lastResult.gravitationalPE;
         line(QString("Total  E: %1 J").arg(totalE, 0, 'e', 3));
+
+        if (sim_.E0 != 0) {
+            double dE = totalE - sim_.E0;
+            double relErr = dE / std::abs(sim_.E0);
+            line(QString("ΔE/E0: %1").arg(relErr, 0, 'e', 3));
+        }
 
         // ── Beam dimensions ──
         y += 10;
@@ -544,11 +391,85 @@ private:
             p.drawText(w / 2 - 50, 40, "⏸  DURAKLATILDI");
         }
     }
+
+    void keyPressEvent(QKeyEvent* e) override {
+        if (e->key() == Qt::Key_Escape) QApplication::quit();
+        else if (e->key() == Qt::Key_Space) paused_ = !paused_;
+        else if (e->key() == Qt::Key_R) { sim_.build(); update(); }
+        else if (e->key() == Qt::Key_Plus || e->key() == Qt::Key_Equal) {
+            zoom_ *= 1.2; update();
+        } else if (e->key() == Qt::Key_Minus) {
+            zoom_ /= 1.2; update();
+        }
+    }
+
+    void mousePressEvent(QMouseEvent* e) override {
+        lastMouse_ = e->pos();
+    }
+
+    void mouseMoveEvent(QMouseEvent* e) override {
+        if (!(e->buttons() & (Qt::LeftButton | Qt::RightButton))) return;
+        QPointF delta = e->pos() - lastMouse_;
+        if (e->buttons() & Qt::LeftButton) {
+            azimuth_ -= delta.x() * 0.01;
+            elevation_ += delta.y() * 0.01;
+        } else {
+            panX_ += delta.x();
+            panY_ += delta.y();
+        }
+        lastMouse_ = e->pos();
+        update();
+    }
+
+    void wheelEvent(QWheelEvent* e) override {
+        double factor = (e->angleDelta().y() > 0) ? 1.2 : 0.833;
+        zoom_ *= factor;
+        update();
+    }
+
+private:
+    Simulation sim_;
+    QTimer* timer_ = nullptr;
+    QProcess* ffmpeg_ = nullptr;
+    QElapsedTimer elapsed_;
+    double frameTime_ = 0;
+
+    // View
+    double zoom_ = 1.0, azimuth_ = 0.3, elevation_ = 0.15;
+    double panX_ = 0, panY_ = 0;
+    QPointF lastMouse_;
+
+    // State
+    bool paused_ = false, recording_ = false;
+
+    void tick() {
+        if (!paused_) sim_.step();
+
+        if (recording_) {
+            QImage img(size(), QImage::Format_ARGB32);
+            QPainter p(&img);
+            paintEvent(nullptr);
+            QByteArray raw;
+            raw.resize(width() * height() * 4);
+            memcpy(raw.data(), img.bits(), raw.size());
+            ffmpeg_->write(raw);
+        }
+
+        update();
+        frameTime_ = elapsed_.nsecsElapsed() / 1e9;
+        elapsed_.start();
+    }
+
+    void stopRecording() {
+        if (ffmpeg_ && ffmpeg_->state() == QProcess::Running) {
+            ffmpeg_->closeWriteChannel();
+            ffmpeg_->waitForFinished(2000);
+        }
+    }
 };
 
 // ─────────────────────────────────────────────
 int main(int argc, char* argv[]) {
-    // Parse -c N for thread count, -r for recording, --hex for hexa mesh
     bool record = false;
     for (int i = 1; i < argc; i++) {
         if (std::string(argv[i]) == "-c" && i+1 < argc) {
@@ -557,13 +478,11 @@ int main(int argc, char* argv[]) {
             record = true;
         } else if (std::string(argv[i]) == "--hex") {
             USE_HEX_MESH = true;
-        } else if (std::string(argv[i]) == "--hht") {
-            USE_HHT_SOLVER = true;
         }
     }
 
     QApplication app(argc, argv);
-    CantileverWidget win(record);
+    CantileverDOPRI45Widget win(record);
     win.show();
     return app.exec();
 }

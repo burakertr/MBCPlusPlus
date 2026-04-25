@@ -610,6 +610,8 @@ FlexStepResult ImplicitFlexIntegrator::step(double dt) {
         double rNorm = 0;
         for (int ii = 0; ii < nf; ii++) rNorm += R[ii]*R[ii];
         rNorm = std::sqrt(rNorm);
+        lastIters_ = newtonIter + 1;
+        lastResNorm_ = rNorm;
         if (rNorm < newtonTol) break;
 
         // Build tangent via central FD (columns are independent)
