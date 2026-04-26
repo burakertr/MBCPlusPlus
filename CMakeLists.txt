@@ -63,6 +63,16 @@ set(LIB_SOURCES
     src/fem/FlexibleContactManager.cpp
     src/fem/FlexibleIntegrators.cpp
     src/fem/MeshGenerators.cpp
+
+    # Vehicle
+    src/vehicle/Road.cpp
+    src/vehicle/TireModel.cpp
+    src/vehicle/Wheel.cpp
+    src/vehicle/Suspension.cpp
+    src/vehicle/Steering.cpp
+    src/vehicle/Drivetrain.cpp
+    src/vehicle/Driver.cpp
+    src/vehicle/Vehicle.cpp
 )
 
 add_library(multibody STATIC ${LIB_SOURCES})
@@ -92,6 +102,9 @@ target_link_libraries(pendulum_benchmark PRIVATE multibody)
 
 add_executable(cantilever_static_test examples/cantilever_static_test.cpp)
 target_link_libraries(cantilever_static_test PRIVATE multibody)
+
+add_executable(vehicle_sanity examples/vehicle_sanity.cpp)
+target_link_libraries(vehicle_sanity PRIVATE multibody)
 
 # ---- Qt visualization (optional) ----
 find_package(Qt5 COMPONENTS Widgets QUIET)
@@ -123,6 +136,9 @@ if(Qt5_FOUND)
 
     add_executable(bending_fracture_qt examples/bending_fracture_qt.cpp)
     target_link_libraries(bending_fracture_qt PRIVATE multibody Qt5::Widgets)
+
+    add_executable(vehicle_qt examples/vehicle_qt.cpp)
+    target_link_libraries(vehicle_qt PRIVATE multibody Qt5::Widgets)
 
 
 
